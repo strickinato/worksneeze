@@ -1,0 +1,47 @@
+#+title: worksneeze
+#+author: Aaron Strick
+
+An Emacs package for managing git worktrees.
+
+* Overview
+
+worksneeze provides a dashboard buffer for viewing and managing git worktrees, with a focus on worktrees it creates itself (stored in a =.worktrees/= subdirectory of the repo root).
+
+* Features
+
+- *Dashboard* (~M-x worksneeze~): Lists all worksneeze-managed worktrees with branch and commit info. The main worktree is shown with a =*= marker.
+- *Create* (~c~ in dashboard, or ~M-x worksneeze-create~): Creates a new worktree + branch under =.worktrees/=. Use ~C-u~ prefix to specify a base branch/commit.
+- *Delete* (dired-style): Mark worktrees with ~D~, unmark with ~u~, execute deletions with ~x~.
+- *Open* (~RET~ in dashboard): Opens the worktree at point in magit (if available) or dired.
+
+* Dashboard Keybindings
+
+| Key   | Action                    |
+|-------+---------------------------|
+| =g=   | Refresh                   |
+| =c=   | Create new worktree       |
+| =D=   | Mark for deletion         |
+| =u=   | Unmark                    |
+| =x=   | Execute pending deletions |
+| =RET= | Open worktree             |
+| =q=   | Quit                      |
+| =n/p= | Navigate lines            |
+
+* Installation
+
+Add the package to your load path and require it:
+
+#+begin_src emacs-lisp
+(require 'worksneeze)
+#+end_src
+
+* Customization
+
+- ~worksneeze-worktree-directory~ (default =".worktrees"=): Subdirectory under the repo root where new worktrees are placed.
+- ~worksneeze-buffer-name~ (default ="*worksneeze*"=): Dashboard buffer name.
+- ~worksneeze-use-magit~ (default ='auto=): Controls whether ~RET~ opens magit-status or dired. Options: =auto=, =t=, =nil=.
+
+* Dependencies
+
+- Emacs 27.1+
+- magit (optional, for opening worktrees with ~magit-status~)
