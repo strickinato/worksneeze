@@ -18,6 +18,8 @@
 
 (declare-function magit-status "magit-status" (&optional directory))
 (declare-function evil-local-set-key "evil-core" (state key def))
+(declare-function projectile-add-known-project "projectile" (project-root))
+(declare-function projectile-remove-known-project "projectile" (&optional project))
 
 ;;; Customization
 
@@ -51,8 +53,8 @@
 Buffer-local in worksneeze-mode buffers.")
 
 (defconst worksneeze--buffer-header
-  "Worktrees   [g] refresh  [c] create  [D] mark delete  [u] unmark  [x] execute  [RET] open  [q] quit\n\
-────────────────────────────────────────────────────────────────────────────────────────────────────────\n"
+  "Worktrees   [g] refresh  [c] create  [C] from branch  [D] mark delete  [u] unmark  [x] execute  [RET] open  [q] quit\n\
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n"
   "Header text for the dashboard buffer.")
 
 ;;; Git Data Layer
@@ -187,6 +189,7 @@ Shows the main worktree with a * marker, then only worksneeze-managed trees."
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "g")   #'worksneeze-refresh)
     (define-key map (kbd "c")   #'worksneeze-create)
+    (define-key map (kbd "C")   #'worksneeze-create-from-branch)
     (define-key map (kbd "D")   #'worksneeze-mark-delete)
     (define-key map (kbd "u")   #'worksneeze-unmark)
     (define-key map (kbd "x")   #'worksneeze-execute)
@@ -209,6 +212,7 @@ Shows the main worktree with a * marker, then only worksneeze-managed trees."
   (when (bound-and-true-p evil-local-mode)
     (evil-local-set-key 'normal (kbd "g")   #'worksneeze-refresh)
     (evil-local-set-key 'normal (kbd "c")   #'worksneeze-create)
+    (evil-local-set-key 'normal (kbd "C")   #'worksneeze-create-from-branch)
     (evil-local-set-key 'normal (kbd "D")   #'worksneeze-mark-delete)
     (evil-local-set-key 'normal (kbd "u")   #'worksneeze-unmark)
     (evil-local-set-key 'normal (kbd "x")   #'worksneeze-execute)
@@ -329,9 +333,52 @@ The mark column is at column 3 (the character after \" D \" or \"   \")."
            (format "Delete %d worktree(s)? " (length paths)))
       (let ((default-directory worksneeze--repo-root))
         (dolist (path paths)
+          (when (fboundp 'projectile-remove-known-project)
+            (projectile-remove-known-project (file-name-as-directory path)))
           (worksneeze--run-git "worktree" "remove" path)
           (message "Removed worktree: %s" path)))
       (worksneeze-refresh))))
+
+;;; Projectile Integration
+
+(defun worksneeze--ensure-worktrees-ignored (root)
+  "Ensure the worktree directory is in ROOT's .gitignore."
+  (let ((gitignore (expand-file-name ".gitignore" root))
+        (entry (concat "/" worksneeze-worktree-directory)))
+    (unless (and (file-exists-p gitignore)
+                 (with-temp-buffer
+                   (insert-file-contents gitignore)
+                   (goto-char (point-min))
+                   (re-search-forward (concat "^" (regexp-quote entry) "$") nil t)))
+      (with-temp-buffer
+        (when (file-exists-p gitignore)
+          (insert-file-contents gitignore)
+          (goto-char (point-max))
+          (unless (bolp) (insert "\n")))
+        (insert entry "\n")
+        (write-region (point-min) (point-max) gitignore)))))
+
+;;; Branch Helpers
+
+(defun worksneeze--remote-branches ()
+  "Return a list of remote branch names (e.g. \"origin/feature-foo\").
+Runs `git fetch --all' first to ensure the list is current.
+Filters out HEAD pointer lines (e.g. \"origin/HEAD -> origin/main\")."
+  (worksneeze--run-git "fetch" "--all")
+  (let ((lines (worksneeze--run-git "branch" "-r")))
+    (delq nil
+          (mapcar (lambda (line)
+                    (let ((trimmed (string-trim line)))
+                      (unless (string-match-p "->" trimmed)
+                        trimmed)))
+                  lines))))
+
+(defun worksneeze--local-branch-exists-p (branch)
+  "Return non-nil if local BRANCH already exists."
+  (condition-case nil
+      (progn (worksneeze--run-git "rev-parse" "--verify" (concat "refs/heads/" branch))
+             t)
+    (error nil)))
 
 ;;; Worktree Creation
 
@@ -358,11 +405,57 @@ With prefix argument, also prompts for a BASE branch or commit."
         (user-error "Path already exists: %s" wt-path))
       (unless (file-directory-p wt-parent)
         (make-directory wt-parent t))
+      (worksneeze--ensure-worktrees-ignored root)
       (let ((default-directory root))
         (apply #'worksneeze--run-git
                (append (list "worktree" "add" "-b" branch wt-path)
                        (when base (list base)))))
       (message "Created worktree at %s (branch: %s)" wt-path branch)
+      (when (fboundp 'projectile-add-known-project)
+        (projectile-add-known-project (file-name-as-directory wt-path)))
+      (when-let ((buf (get-buffer worksneeze-buffer-name)))
+        (with-current-buffer buf
+          (worksneeze-refresh))))))
+
+;;; Worktree Creation from Remote Branch
+
+;;;###autoload
+(defun worksneeze-create-from-branch (remote-branch)
+  "Create a new worktree tracking REMOTE-BRANCH.
+Fetches all remotes, then prompts for a remote branch with completion.
+Creates a local branch (stripping the remote prefix) that tracks the
+remote branch, and places the worktree under `worksneeze-worktree-directory'."
+  (interactive
+   (let* ((root (or (and (derived-mode-p 'worksneeze-mode) worksneeze--repo-root)
+                    (worksneeze--repo-root-for default-directory)))
+          (_ (unless root (user-error "Not inside a git repository")))
+          (default-directory root)
+          (branches (worksneeze--remote-branches)))
+     (unless branches
+       (user-error "No remote branches found"))
+     (list (completing-read "Remote branch: " branches nil t))))
+  (let ((root (or (and (derived-mode-p 'worksneeze-mode) worksneeze--repo-root)
+                  (worksneeze--repo-root-for default-directory))))
+    (unless root
+      (user-error "Not inside a git repository"))
+    (let* ((local-name (if (string-match "^[^/]+/\\(.+\\)$" remote-branch)
+                           (match-string 1 remote-branch)
+                         remote-branch))
+           (wt-parent (expand-file-name worksneeze-worktree-directory root))
+           (wt-path (expand-file-name local-name wt-parent)))
+      (when (file-exists-p wt-path)
+        (user-error "Path already exists: %s" wt-path))
+      (unless (file-directory-p wt-parent)
+        (make-directory wt-parent t))
+      (worksneeze--ensure-worktrees-ignored root)
+      (let ((default-directory root))
+        (if (worksneeze--local-branch-exists-p local-name)
+            (worksneeze--run-git "worktree" "add" wt-path local-name)
+          (worksneeze--run-git "worktree" "add" "--track" "-b" local-name wt-path remote-branch)))
+      (message "Created worktree at %s (local branch: %s tracking %s)"
+               wt-path local-name remote-branch)
+      (when (fboundp 'projectile-add-known-project)
+        (projectile-add-known-project (file-name-as-directory wt-path)))
       (when-let ((buf (get-buffer worksneeze-buffer-name)))
         (with-current-buffer buf
           (worksneeze-refresh))))))
