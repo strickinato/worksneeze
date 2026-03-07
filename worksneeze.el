@@ -55,8 +55,8 @@
 Buffer-local in worksneeze-mode buffers.")
 
 (defconst worksneeze--buffer-header
-  "Worktrees   [g] refresh  [c] create  [D] mark delete  [u] unmark  [x] execute  [RET] open  [q] quit\n\
-────────────────────────────────────────────────────────────────────────────────────────────────────\n"
+  "Worktrees   [g] refresh  [c] create  [P] from PR  [D] mark delete  [u] unmark  [x] execute  [RET] open  [q] quit\n\
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n"
   "Header text for the dashboard buffer.")
 
 ;;; Git Data Layer
@@ -191,6 +191,7 @@ Shows the main worktree with a * marker, then only worksneeze-managed trees."
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "g")   #'worksneeze-refresh)
     (define-key map (kbd "c")   #'worksneeze-create)
+    (define-key map (kbd "P")   #'worksneeze-create-from-pr)
     (define-key map (kbd "D")   #'worksneeze-mark-delete)
     (define-key map (kbd "u")   #'worksneeze-unmark)
     (define-key map (kbd "x")   #'worksneeze-execute)
@@ -213,6 +214,7 @@ Shows the main worktree with a * marker, then only worksneeze-managed trees."
   (when (bound-and-true-p evil-local-mode)
     (evil-local-set-key 'normal (kbd "g")   #'worksneeze-refresh)
     (evil-local-set-key 'normal (kbd "c")   #'worksneeze-create)
+    (evil-local-set-key 'normal (kbd "P")   #'worksneeze-create-from-pr)
     (evil-local-set-key 'normal (kbd "D")   #'worksneeze-mark-delete)
     (evil-local-set-key 'normal (kbd "u")   #'worksneeze-unmark)
     (evil-local-set-key 'normal (kbd "x")   #'worksneeze-execute)
@@ -380,6 +382,22 @@ Filters out HEAD pointer lines (e.g. \"origin/HEAD -> origin/main\")."
              t)
     (error nil)))
 
+;;; GitHub PR Integration
+
+(defun worksneeze--gh-available-p ()
+  "Return non-nil if the `gh' CLI is installed and authenticated."
+  (and (executable-find "gh")
+       (zerop (call-process "gh" nil nil nil "auth" "status"))))
+
+(defun worksneeze--gh-pr-branch (pr-url)
+  "Return the head branch name for the GitHub PR at PR-URL.
+Uses `gh pr view' to extract the headRefName."
+  (let ((json (shell-command-to-string
+               (format "gh pr view %s --json headRefName 2>/dev/null"
+                       (shell-quote-argument pr-url)))))
+    (when (string-match "\"headRefName\":\"\\([^\"]+\\)\"" json)
+      (match-string 1 json))))
+
 ;;; Worktree Creation
 
 ;;;###autoload
@@ -435,7 +453,38 @@ branch or commit (only used when creating a new branch)."
         (projectile-add-known-project (file-name-as-directory wt-path)))
       (when-let ((buf (get-buffer worksneeze-buffer-name)))
         (with-current-buffer buf
-          (worksneeze-refresh))))))
+          (worksneeze-refresh)))
+      (if (worksneeze--use-magit-p)
+          (magit-status wt-path)
+        (dired wt-path)))))
+
+;;;###autoload
+(defun worksneeze-create-from-pr (pr-url)
+  "Create a worktree for the branch of a GitHub pull request at PR-URL.
+Requires the `gh' CLI to be installed and authenticated.
+Fetches remotes, resolves the PR's head branch, and creates a tracking
+worktree under `worksneeze-worktree-directory'."
+  (interactive
+   (progn
+     (unless (worksneeze--gh-available-p)
+       (user-error "The `gh' CLI is not installed or not authenticated"))
+     (list (read-string "PR URL: "))))
+  (let* ((root (or (and (derived-mode-p 'worksneeze-mode) worksneeze--repo-root)
+                   (worksneeze--repo-root-for default-directory)))
+         (_ (unless root (user-error "Not inside a git repository")))
+         (branch (worksneeze--gh-pr-branch pr-url)))
+    (unless branch
+      (user-error "Could not resolve branch for PR: %s" pr-url))
+    (let ((default-directory root))
+      (worksneeze--run-git "fetch" "--all"))
+    (let* ((remotes (let ((default-directory root))
+                      (worksneeze--run-git "branch" "-r")))
+           (remote-ref (seq-find (lambda (r)
+                                   (string-suffix-p (concat "/" branch) (string-trim r)))
+                                 remotes)))
+      (unless remote-ref
+        (user-error "Branch %s not found on any remote (fetched all remotes)" branch))
+      (worksneeze-create (string-trim remote-ref)))))
 
 (provide 'worksneeze)
 ;;; worksneeze.el ends here
