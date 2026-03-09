@@ -18,6 +18,8 @@
 
 ;;; Code:
 
+(require 'transient)
+
 (declare-function magit-status "magit-status" (&optional directory))
 (declare-function evil-define-key* "evil-core" (state keymap &rest bindings))
 (declare-function projectile-add-known-project "projectile" (project-root))
@@ -56,14 +58,15 @@
 
 ;;; Variables
 
+(defvar worksneeze-after-create-functions nil
+  "Abnormal hook run after a worktree is created.
+Each function is called with two arguments: WT-PATH (the new
+worktree directory) and REPO-ROOT (the repository root).")
+
 (defvar worksneeze--repo-root nil
   "Repo root for the current dashboard buffer.
 Buffer-local in worksneeze-mode buffers.")
 
-(defconst worksneeze--buffer-header
-  "Worktrees   [g] refresh  [c] create  [P] from PR  [a] agent  [D] mark delete  [u] unmark  [x] execute  [RET] open  [q] quit\n\
-────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n"
-  "Header text for the dashboard buffer.")
 
 ;;; Git Data Layer
 
@@ -179,14 +182,17 @@ Returns nil if agent-shell is not loaded."
           (result nil))
       (dolist (buf (agent-shell-buffers))
         (when (buffer-live-p buf)
-          (with-current-buffer buf
-            (let ((cwd (file-name-as-directory (agent-shell-cwd))))
-              (when (string-prefix-p path-dir cwd)
-                (push (list (cons :buffer buf)
-                            (cons :name (buffer-name buf))
-                            (cons :active-p (not (null (map-elt agent-shell--state
-                                                                :active-request)))))
-                      result))))))
+          (condition-case nil
+              (with-current-buffer buf
+                (let ((cwd (file-name-as-directory (agent-shell-cwd))))
+                  (when (and (file-directory-p cwd)
+                             (string-prefix-p path-dir cwd))
+                    (push (list (cons :buffer buf)
+                                (cons :name (buffer-name buf))
+                                (cons :active-p (not (null (map-elt agent-shell--state
+                                                                    :active-request)))))
+                          result))))
+            (error nil))))
       (nreverse result))))
 
 (defun worksneeze--agent-status-string (path)
@@ -248,8 +254,8 @@ dashboard updates when agents finish processing."
   "Return non-nil if WORKTREE is the main worktree (the repo root)."
   (string= (file-name-as-directory (alist-get :path worktree)) repo-root))
 
-(defun worksneeze--render-worktree-line (wt &optional marker)
-  "Render a single worktree line for WT.
+(defun worksneeze--render-worktree-entry (wt &optional marker)
+  "Render a worktree entry for WT as a multi-line block.
 MARKER is an optional string prefix (e.g. \"*\")."
   (let* ((path (alist-get :path wt))
          (head (alist-get :head wt))
@@ -263,17 +269,13 @@ MARKER is an optional string prefix (e.g. \"*\")."
           (propertize (substring head 0 (min 8 (length head)))
                       'face 'worksneeze-head))
          (agent-str (worksneeze--agent-status-string path))
-         (line-start (point)))
-    (insert (format " %s %s %-30s  %-20s  %s"
-                    (or marker " ")
-                    " "
-                    name
-                    branch-str
-                    head-str))
+         (entry-start (point)))
+    (insert (format " %s %s\n" (or marker " ") (propertize name 'face 'worksneeze-path)))
+    (insert (format "     %s  %s" branch-str head-str))
     (when agent-str
       (insert "  " agent-str))
     (insert "\n")
-    (put-text-property line-start (point) 'worksneeze-path path)))
+    (put-text-property entry-start (point) 'worksneeze-path path)))
 
 (defun worksneeze--render (worktrees repo-root)
   "Render WORKTREES into the current buffer.
@@ -284,18 +286,34 @@ Shows the main worktree with a * marker, then only worksneeze-managed trees."
          (managed (seq-filter (lambda (wt) (worksneeze--managed-p wt repo-root))
                               worktrees)))
     (erase-buffer)
-    (insert worksneeze--buffer-header)
     (when main-wt
-      (worksneeze--render-worktree-line main-wt "*"))
+      (worksneeze--render-worktree-entry main-wt "*"))
     (if (null managed)
         (insert "  (no managed worktrees)\n")
       (dolist (wt managed)
-        (worksneeze--render-worktree-line wt)))
+        (worksneeze--render-worktree-entry wt)))
     (goto-char (point-min))
-    (forward-line 2)
     (worksneeze--subscribe-to-agent-events)))
 
 ;;; Dashboard Major Mode
+
+(transient-define-prefix worksneeze-menu ()
+  "Worksneeze commands."
+  [["Navigate"
+    ("RET" "Open worktree" worksneeze-open-at-point)
+    ("n" "Next line" next-line :transient t)
+    ("p" "Previous line" previous-line :transient t)
+    ("g" "Refresh" worksneeze-refresh)]
+   ["Create"
+    ("c" "New worktree" worksneeze-create)
+    ("P" "From PR" worksneeze-create-from-pr)
+    ("a" "Open agent" worksneeze-open-agent)]
+   ["Delete"
+    ("D" "Mark delete" worksneeze-mark-delete :transient t)
+    ("u" "Unmark" worksneeze-unmark :transient t)
+    ("x" "Execute" worksneeze-execute)]
+   ["Other"
+    ("q" "Quit" quit-window)]])
 
 (defconst worksneeze-mode-map
   (let ((map (make-sparse-keymap)))
@@ -310,6 +328,7 @@ Shows the main worktree with a * marker, then only worksneeze-managed trees."
     (define-key map (kbd "q")   #'quit-window)
     (define-key map (kbd "n")   #'next-line)
     (define-key map (kbd "p")   #'previous-line)
+    (define-key map (kbd "?")   #'worksneeze-menu)
     map)
   "Keymap for `worksneeze-mode'.")
 
@@ -334,7 +353,8 @@ Shows the main worktree with a * marker, then only worksneeze-managed trees."
       (kbd "u")   #'worksneeze-unmark
       (kbd "x")   #'worksneeze-execute
       (kbd "RET") #'worksneeze-open-at-point
-      (kbd "q")   #'quit-window)))
+      (kbd "q")   #'quit-window
+      (kbd "?")   #'worksneeze-menu)))
 
 ;;; Entry Points
 
@@ -399,20 +419,43 @@ Otherwise start a new agent-shell in the worktree directory."
 
 ;;; Marking and Deletion
 
-(defun worksneeze--mark-column-pos ()
-  "Return the buffer position of the mark column on the current line, or nil.
-The mark column is at column 3 (the character after \" D \" or \"   \")."
-  (save-excursion
-    (beginning-of-line)
+(defun worksneeze--entry-header-pos ()
+  "Move to the header line of the current worktree entry and return its position.
+Returns nil if point is not on a worktree entry."
+  (when (get-text-property (point) 'worksneeze-path)
     (let ((path (get-text-property (point) 'worksneeze-path)))
-      (when path
-        (+ (line-beginning-position) 1)))))
+      (save-excursion
+        ;; Walk backward to find the first line of this entry
+        (beginning-of-line)
+        (while (and (not (bobp))
+                    (save-excursion
+                      (forward-line -1)
+                      (equal (get-text-property (point) 'worksneeze-path) path)))
+          (forward-line -1))
+        (point)))))
+
+(defun worksneeze--mark-column-pos ()
+  "Return the buffer position of the mark column on the header line, or nil.
+The mark column is at column 1 on the header line of the entry."
+  (when-let ((header (worksneeze--entry-header-pos)))
+    (+ header 1)))
 
 (defun worksneeze--main-line-p ()
-  "Return non-nil if the current line is the main worktree (marked with *)."
-  (save-excursion
-    (beginning-of-line)
-    (looking-at " \\*")))
+  "Return non-nil if the current entry is the main worktree (marked with *)."
+  (when-let ((header (worksneeze--entry-header-pos)))
+    (save-excursion
+      (goto-char header)
+      (looking-at " \\*"))))
+
+(defun worksneeze--goto-next-entry ()
+  "Move point to the header line of the next worktree entry."
+  (let ((cur-path (get-text-property (point) 'worksneeze-path)))
+    ;; Skip past all lines of current entry
+    (while (and (not (eobp))
+                (equal (get-text-property (point) 'worksneeze-path) cur-path))
+      (forward-line 1))
+    ;; Now on next entry or eobp
+    ))
 
 (defun worksneeze-mark-delete ()
   "Mark the worktree at point for deletion."
@@ -427,7 +470,7 @@ The mark column is at column 3 (the character after \" D \" or \"   \")."
         (goto-char pos)
         (delete-char 1)
         (insert (propertize "D" 'face 'worksneeze-marked-delete)))))
-  (forward-line 1))
+  (worksneeze--goto-next-entry))
 
 (defun worksneeze-unmark ()
   "Remove the deletion mark from the worktree at point."
@@ -440,19 +483,23 @@ The mark column is at column 3 (the character after \" D \" or \"   \")."
         (goto-char pos)
         (delete-char 1)
         (insert " "))))
-  (forward-line 1))
+  (worksneeze--goto-next-entry))
 
 (defun worksneeze--collect-marked-paths ()
   "Return a list of paths marked for deletion."
-  (let ((paths nil))
+  (let ((paths nil)
+        (seen nil))
     (save-excursion
       (goto-char (point-min))
       (while (not (eobp))
-        (when (and (get-text-property (point) 'worksneeze-path)
-                   (save-excursion
-                     (beginning-of-line)
-                     (looking-at " D")))
-          (push (get-text-property (point) 'worksneeze-path) paths))
+        (let ((path (get-text-property (point) 'worksneeze-path)))
+          (when (and path
+                     (not (member path seen))
+                     (save-excursion
+                       (goto-char (worksneeze--entry-header-pos))
+                       (looking-at " D")))
+            (push path paths)
+            (push path seen)))
         (forward-line 1)))
     (nreverse paths)))
 
@@ -467,7 +514,8 @@ The mark column is at column 3 (the character after \" D \" or \"   \")."
       (let ((default-directory worksneeze--repo-root))
         (dolist (path paths)
           (when (fboundp 'projectile-remove-known-project)
-            (projectile-remove-known-project (file-name-as-directory path)))
+            (projectile-remove-known-project
+             (file-name-as-directory (abbreviate-file-name path))))
           (worksneeze--run-git "worktree" "remove" path)
           (message "Removed worktree: %s" path)))
       (worksneeze-refresh))))
@@ -582,10 +630,12 @@ also prompts for a BASE branch or commit (only used for new branches)."
                          (when base (list base)))))))
       (message "Created worktree at %s (branch: %s)" wt-path local-name)
       (when (fboundp 'projectile-add-known-project)
-        (projectile-add-known-project (file-name-as-directory wt-path)))
+        (projectile-add-known-project
+         (file-name-as-directory (abbreviate-file-name wt-path))))
       (when-let ((buf (get-buffer worksneeze-buffer-name)))
         (with-current-buffer buf
           (worksneeze-refresh)))
+      (run-hook-with-args 'worksneeze-after-create-functions wt-path root)
       (if (worksneeze--use-magit-p)
           (magit-status wt-path)
         (dired wt-path)))))
