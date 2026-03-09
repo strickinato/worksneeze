@@ -22,6 +22,12 @@
 (declare-function evil-define-key* "evil-core" (state keymap &rest bindings))
 (declare-function projectile-add-known-project "projectile" (project-root))
 (declare-function projectile-remove-known-project "projectile" (&optional project))
+(declare-function agent-shell "agent-shell" (&optional prefix))
+(declare-function agent-shell-buffers "agent-shell" ())
+(declare-function agent-shell-cwd "agent-shell-project" ())
+(declare-function agent-shell-subscribe-to "agent-shell"
+                  (&rest args &key shell-buffer event on-event))
+(defvar agent-shell--state)
 
 ;;; Customization
 
@@ -55,8 +61,8 @@
 Buffer-local in worksneeze-mode buffers.")
 
 (defconst worksneeze--buffer-header
-  "Worktrees   [g] refresh  [c] create  [P] from PR  [D] mark delete  [u] unmark  [x] execute  [RET] open  [q] quit\n\
-──────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n"
+  "Worktrees   [g] refresh  [c] create  [P] from PR  [a] agent  [D] mark delete  [u] unmark  [x] execute  [RET] open  [q] quit\n\
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n"
   "Header text for the dashboard buffer.")
 
 ;;; Git Data Layer
@@ -74,8 +80,21 @@ rather than the linked worktree's root."
 
 (defun worksneeze--run-git (&rest args)
   "Run git with ARGS in `default-directory', return list of output lines.
-Signals an error if git exits non-zero."
-  (apply #'process-lines "git" args))
+Signals an error with stderr output if git exits non-zero."
+  (let ((stderr-file (make-temp-file "worksneeze-git-")))
+    (unwind-protect
+        (with-temp-buffer
+          (let ((exit-code (apply #'call-process "git" nil
+                                  (list t stderr-file) nil args)))
+            (unless (zerop exit-code)
+              (user-error "git %s failed (exit %d): %s"
+                          (car args) exit-code
+                          (string-trim
+                           (with-temp-buffer
+                             (insert-file-contents stderr-file)
+                             (buffer-string)))))
+            (split-string (buffer-string) "\n" t)))
+      (delete-file stderr-file))))
 
 (defun worksneeze--parse-porcelain (lines)
   "Parse LINES from `git worktree list --porcelain'.
@@ -133,6 +152,90 @@ Returns a list of alists, each with keys:
   "Face for the D delete marker."
   :group 'worksneeze)
 
+(defface worksneeze-agent-busy
+  '((t :inherit warning :weight bold))
+  "Face for busy agent indicator."
+  :group 'worksneeze)
+
+(defface worksneeze-agent-idle
+  '((t :inherit font-lock-comment-face))
+  "Face for idle agent indicator."
+  :group 'worksneeze)
+
+;;; Agent-Shell Integration
+
+(defvar worksneeze--refresh-timer nil
+  "Debounce timer for agent event refresh.")
+
+(defvar worksneeze--subscribed-buffers nil
+  "List of agent-shell buffers we have subscribed to.")
+
+(defun worksneeze--agents-for-path (path)
+  "Return list of agent info for agents whose CWD is under PATH.
+Each entry is an alist with :buffer, :name, and :active-p keys.
+Returns nil if agent-shell is not loaded."
+  (when (featurep 'agent-shell)
+    (let ((path-dir (file-name-as-directory path))
+          (result nil))
+      (dolist (buf (agent-shell-buffers))
+        (when (buffer-live-p buf)
+          (with-current-buffer buf
+            (let ((cwd (file-name-as-directory (agent-shell-cwd))))
+              (when (string-prefix-p path-dir cwd)
+                (push (list (cons :buffer buf)
+                            (cons :name (buffer-name buf))
+                            (cons :active-p (not (null (map-elt agent-shell--state
+                                                                :active-request)))))
+                      result))))))
+      (nreverse result))))
+
+(defun worksneeze--agent-status-string (path)
+  "Return a propertized agent status string for worktree at PATH, or nil."
+  (when-let ((agents (worksneeze--agents-for-path path)))
+    (let* ((count (length agents))
+           (busy-count (length (seq-filter (lambda (a) (alist-get :active-p a)) agents))))
+      (cond
+       ((= count 1)
+        (if (> busy-count 0)
+            (propertize "[agent: busy]" 'face 'worksneeze-agent-busy)
+          (propertize "[agent: idle]" 'face 'worksneeze-agent-idle)))
+       (t
+        (if (> busy-count 0)
+            (propertize (format "[%d agents: %d busy]" count busy-count)
+                        'face 'worksneeze-agent-busy)
+          (propertize (format "[%d agents: idle]" count)
+                      'face 'worksneeze-agent-idle)))))))
+
+(defun worksneeze--subscribe-to-agent-events ()
+  "Subscribe to agent-shell events for live dashboard refresh.
+Subscribes to prompt-ready events on all agent buffers so the
+dashboard updates when agents finish processing."
+  (when (featurep 'agent-shell)
+    (dolist (buf (agent-shell-buffers))
+      (when (and (buffer-live-p buf)
+                 (not (memq buf worksneeze--subscribed-buffers)))
+        (push buf worksneeze--subscribed-buffers)
+        (agent-shell-subscribe-to
+         :shell-buffer buf
+         :event 'prompt-ready
+         :on-event #'worksneeze--on-agent-event)))))
+
+(defun worksneeze--on-agent-event (_event)
+  "Handle an agent-shell event by scheduling a debounced dashboard refresh."
+  (when (timerp worksneeze--refresh-timer)
+    (cancel-timer worksneeze--refresh-timer))
+  (setq worksneeze--refresh-timer
+        (run-with-timer 0.5 nil #'worksneeze--maybe-refresh)))
+
+(defun worksneeze--maybe-refresh ()
+  "Refresh the dashboard if the buffer exists."
+  (when-let ((buf (get-buffer worksneeze-buffer-name)))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (when (derived-mode-p 'worksneeze-mode)
+          (let ((default-directory worksneeze--repo-root))
+            (worksneeze--render (worksneeze--list-worktrees) worksneeze--repo-root)))))))
+
 ;;; Dashboard Rendering
 
 (defun worksneeze--managed-p (worktree repo-root)
@@ -159,13 +262,17 @@ MARKER is an optional string prefix (e.g. \"*\")."
          (head-str
           (propertize (substring head 0 (min 8 (length head)))
                       'face 'worksneeze-head))
+         (agent-str (worksneeze--agent-status-string path))
          (line-start (point)))
-    (insert (format " %s %s %-30s  %-20s  %s\n"
+    (insert (format " %s %s %-30s  %-20s  %s"
                     (or marker " ")
                     " "
                     name
                     branch-str
                     head-str))
+    (when agent-str
+      (insert "  " agent-str))
+    (insert "\n")
     (put-text-property line-start (point) 'worksneeze-path path)))
 
 (defun worksneeze--render (worktrees repo-root)
@@ -185,7 +292,8 @@ Shows the main worktree with a * marker, then only worksneeze-managed trees."
       (dolist (wt managed)
         (worksneeze--render-worktree-line wt)))
     (goto-char (point-min))
-    (forward-line 2)))
+    (forward-line 2)
+    (worksneeze--subscribe-to-agent-events)))
 
 ;;; Dashboard Major Mode
 
@@ -194,6 +302,7 @@ Shows the main worktree with a * marker, then only worksneeze-managed trees."
     (define-key map (kbd "g")   #'worksneeze-refresh)
     (define-key map (kbd "c")   #'worksneeze-create)
     (define-key map (kbd "P")   #'worksneeze-create-from-pr)
+    (define-key map (kbd "a")   #'worksneeze-open-agent)
     (define-key map (kbd "D")   #'worksneeze-mark-delete)
     (define-key map (kbd "u")   #'worksneeze-unmark)
     (define-key map (kbd "x")   #'worksneeze-execute)
@@ -220,6 +329,7 @@ Shows the main worktree with a * marker, then only worksneeze-managed trees."
       (kbd "g")   #'worksneeze-refresh
       (kbd "c")   #'worksneeze-create
       (kbd "P")   #'worksneeze-create-from-pr
+      (kbd "a")   #'worksneeze-open-agent
       (kbd "D")   #'worksneeze-mark-delete
       (kbd "u")   #'worksneeze-unmark
       (kbd "x")   #'worksneeze-execute
@@ -270,6 +380,22 @@ Shows the main worktree with a * marker, then only worksneeze-managed trees."
     (if (worksneeze--use-magit-p)
         (magit-status path)
       (dired path))))
+
+(defun worksneeze-open-agent ()
+  "Open or start an agent-shell for the worktree at point.
+If an agent is already running in the worktree, switch to its buffer.
+Otherwise start a new agent-shell in the worktree directory."
+  (interactive)
+  (unless (featurep 'agent-shell)
+    (user-error "agent-shell is not installed"))
+  (let ((path (get-text-property (point) 'worksneeze-path)))
+    (unless path
+      (user-error "No worktree on this line"))
+    (let ((agents (worksneeze--agents-for-path path)))
+      (if agents
+          (pop-to-buffer (alist-get :buffer (car agents)))
+        (let ((default-directory (file-name-as-directory path)))
+          (agent-shell))))))
 
 ;;; Marking and Deletion
 
@@ -406,12 +532,12 @@ Uses `gh pr view' to extract the headRefName."
 ;;; Worktree Creation
 
 ;;;###autoload
-(defun worksneeze-create (branch-or-remote &optional base)
+(defun worksneeze-create (branch-or-remote &optional is-remote base)
   "Create a new git worktree under `worksneeze-worktree-directory'.
-Prompts with completion from remote branches.  If BRANCH-OR-REMOTE matches
-a remote branch, creates a worktree tracking it.  Otherwise creates a new
-branch with that name.  With prefix argument, also prompts for a BASE
-branch or commit (only used when creating a new branch)."
+Prompts with completion from remote branches.  If BRANCH-OR-REMOTE is a
+remote branch (IS-REMOTE non-nil), creates a worktree tracking it.
+Otherwise creates a new branch with that name.  With prefix argument,
+also prompts for a BASE branch or commit (only used for new branches)."
   (interactive
    (let* ((root (or (and (derived-mode-p 'worksneeze-mode) worksneeze--repo-root)
                     (worksneeze--repo-root-for default-directory)))
@@ -419,18 +545,19 @@ branch or commit (only used when creating a new branch)."
           (default-directory root)
           (remotes (worksneeze--remote-branches))
           (input (completing-read "Branch: " remotes nil nil))
-          (base (when (and current-prefix-arg
-                           (not (member input remotes)))
+          (is-remote (member input remotes))
+          (base (when (and current-prefix-arg (not is-remote))
                   (read-string "Base branch/commit (blank for HEAD): "
                                nil nil ""))))
-     (list input (and base (not (string-empty-p base)) base))))
+     (list input is-remote (and base (not (string-empty-p base)) base))))
   (let ((root (or (and (derived-mode-p 'worksneeze-mode) worksneeze--repo-root)
                   (worksneeze--repo-root-for default-directory))))
     (unless root
       (user-error "Not inside a git repository"))
     (when (string-empty-p branch-or-remote)
       (user-error "Branch name cannot be empty"))
-    (let* ((remote-p (and (string-match "^[^/]+/\\(.+\\)$" branch-or-remote)
+    (let* ((remote-p (and is-remote
+                          (string-match "^[^/]+/\\(.+\\)$" branch-or-remote)
                           (match-string 1 branch-or-remote)))
            (local-name (or remote-p branch-or-remote))
            (wt-parent (expand-file-name worksneeze-worktree-directory root))
@@ -489,7 +616,7 @@ worktree under `worksneeze-worktree-directory'."
                                  remotes)))
       (unless remote-ref
         (user-error "Branch %s not found on any remote (fetched all remotes)" branch))
-      (worksneeze-create (string-trim remote-ref)))))
+      (worksneeze-create (string-trim remote-ref) t))))
 
 (provide 'worksneeze)
 ;;; worksneeze.el ends here
