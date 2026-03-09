@@ -19,7 +19,7 @@
 ;;; Code:
 
 (declare-function magit-status "magit-status" (&optional directory))
-(declare-function evil-local-set-key "evil-core" (state key def))
+(declare-function evil-define-key* "evil-core" (state keymap &rest bindings))
 (declare-function projectile-add-known-project "projectile" (project-root))
 (declare-function projectile-remove-known-project "projectile" (&optional project))
 
@@ -62,13 +62,15 @@ Buffer-local in worksneeze-mode buffers.")
 ;;; Git Data Layer
 
 (defun worksneeze--repo-root-for (dir)
-  "Return the git repo root containing DIR, or nil."
+  "Return the main git repo root containing DIR, or nil.
+When DIR is inside a worktree, returns the main worktree root
+rather than the linked worktree's root."
   (let ((default-directory dir))
-    (let ((result (string-trim
-                   (shell-command-to-string
-                    "git rev-parse --show-toplevel 2>/dev/null"))))
-      (unless (string-empty-p result)
-        (file-name-as-directory result)))))
+    (let ((git-common-dir (string-trim
+                           (shell-command-to-string
+                            "git rev-parse --path-format=absolute --git-common-dir 2>/dev/null"))))
+      (unless (string-empty-p git-common-dir)
+        (file-name-as-directory (file-name-directory (directory-file-name git-common-dir)))))))
 
 (defun worksneeze--run-git (&rest args)
   "Run git with ARGS in `default-directory', return list of output lines.
@@ -208,18 +210,21 @@ Shows the main worktree with a * marker, then only worksneeze-managed trees."
   :group 'worksneeze
   (setq truncate-lines t)
   (buffer-disable-undo)
-  ;; When evil-mode is active, Doom's special-mode integration remaps most
-  ;; normal-state keys to `ignore'.  Bind our keys in the evil normal-state
-  ;; auxiliary keymap so they take precedence.
-  (when (bound-and-true-p evil-local-mode)
-    (evil-local-set-key 'normal (kbd "g")   #'worksneeze-refresh)
-    (evil-local-set-key 'normal (kbd "c")   #'worksneeze-create)
-    (evil-local-set-key 'normal (kbd "P")   #'worksneeze-create-from-pr)
-    (evil-local-set-key 'normal (kbd "D")   #'worksneeze-mark-delete)
-    (evil-local-set-key 'normal (kbd "u")   #'worksneeze-unmark)
-    (evil-local-set-key 'normal (kbd "x")   #'worksneeze-execute)
-    (evil-local-set-key 'normal (kbd "RET") #'worksneeze-open-at-point)
-    (evil-local-set-key 'normal (kbd "q")   #'quit-window)))
+  ;; When evil-mode is active, Doom's special-mode integration remaps evil
+  ;; commands like evil-delete-line to `ignore'.  Since D/x/u etc. resolve
+  ;; through evil commands before reaching our mode-map bindings, we must
+  ;; put our bindings on the mode's evil auxiliary keymap via
+  ;; `evil-define-key*' so they take priority over the remaps.
+  (when (bound-and-true-p evil-mode)
+    (evil-define-key* 'normal worksneeze-mode-map
+      (kbd "g")   #'worksneeze-refresh
+      (kbd "c")   #'worksneeze-create
+      (kbd "P")   #'worksneeze-create-from-pr
+      (kbd "D")   #'worksneeze-mark-delete
+      (kbd "u")   #'worksneeze-unmark
+      (kbd "x")   #'worksneeze-execute
+      (kbd "RET") #'worksneeze-open-at-point
+      (kbd "q")   #'quit-window)))
 
 ;;; Entry Points
 
