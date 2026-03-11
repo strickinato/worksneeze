@@ -28,6 +28,7 @@
 (declare-function projectile-remove-known-project "projectile" (&optional project))
 (declare-function project-known-project-roots "project" ())
 (defvar projectile-known-projects)
+(declare-function recompile "compile" (&optional edit-command))
 (declare-function agent-shell "agent-shell" (&optional prefix))
 (declare-function agent-shell-buffers "agent-shell" ())
 (declare-function agent-shell-cwd "agent-shell-project" ())
@@ -217,18 +218,33 @@ git repo root."
 
 ;;; Faces
 
-(defface worksneeze-path
-  '((t :inherit font-lock-function-name-face))
-  "Face for worktree path in the dashboard."
+(defface worksneeze-header
+  '((t :weight bold :height 1.15))
+  "Face for the top-level dashboard header."
   :group 'worksneeze)
 
 (defface worksneeze-project-header
-  '((t :inherit font-lock-constant-face :weight bold))
+  '((t :inherit font-lock-constant-face :weight bold :height 1.1))
   "Face for project section headers in the dashboard."
   :group 'worksneeze)
 
+(defface worksneeze-separator
+  '((t :inherit shadow))
+  "Face for separator lines between sections."
+  :group 'worksneeze)
+
+(defface worksneeze-path
+  '((t :inherit font-lock-function-name-face :weight bold))
+  "Face for worktree name in the dashboard."
+  :group 'worksneeze)
+
+(defface worksneeze-main-marker
+  '((t :inherit success :weight bold))
+  "Face for the main worktree marker."
+  :group 'worksneeze)
+
 (defface worksneeze-branch
-  '((t :inherit font-lock-keyword-face))
+  '((t :inherit font-lock-keyword-face :slant italic))
   "Face for branch name in the dashboard."
   :group 'worksneeze)
 
@@ -238,12 +254,12 @@ git repo root."
   :group 'worksneeze)
 
 (defface worksneeze-detached
-  '((t :inherit font-lock-warning-face))
+  '((t :inherit font-lock-warning-face :slant italic))
   "Face for detached HEAD indicator."
   :group 'worksneeze)
 
 (defface worksneeze-marked-delete
-  '((t :inherit error))
+  '((t :inherit error :weight bold))
   "Face for the D delete marker."
   :group 'worksneeze)
 
@@ -267,10 +283,75 @@ git repo root."
   "Face for draft PR indicator."
   :group 'worksneeze)
 
-;;; Agent-Shell Integration
+(defface worksneeze-compile-running
+  '((t :inherit success :weight bold))
+  "Face for running compilation indicator."
+  :group 'worksneeze)
+
+(defface worksneeze-compile-done
+  '((t :inherit font-lock-comment-face))
+  "Face for finished compilation indicator."
+  :group 'worksneeze)
+
+(defface worksneeze-clean
+  '((t :inherit success))
+  "Face for clean worktree status."
+  :group 'worksneeze)
+
+(defface worksneeze-dirty
+  '((t :inherit warning))
+  "Face for dirty worktree status."
+  :group 'worksneeze)
+
+(defface worksneeze-empty
+  '((t :inherit shadow :slant italic))
+  "Face for empty state messages."
+  :group 'worksneeze)
 
 (defvar worksneeze--refresh-timer nil
-  "Debounce timer for agent event refresh.")
+  "Debounce timer for dashboard refresh.")
+
+;;; Compilation Buffer Integration
+
+(defvar worksneeze--compilation-buffers nil
+  "Alist mapping worktree path strings to compilation buffers.")
+
+(defun worksneeze-register-compilation (wt-path buffer)
+  "Associate compilation BUFFER with worktree at WT-PATH.
+External packages call this after starting a compilation in a worktree."
+  (let ((key (file-name-as-directory wt-path)))
+    (setf (alist-get key worksneeze--compilation-buffers nil nil #'equal) buffer)))
+
+(defun worksneeze--compilation-for-path (path)
+  "Return the compilation buffer for worktree at PATH, or nil.
+Cleans up stale entries for dead buffers."
+  (let* ((key (file-name-as-directory path))
+         (buf (alist-get key worksneeze--compilation-buffers nil nil #'equal)))
+    (cond
+     ((and buf (buffer-live-p buf)) buf)
+     (buf
+      (setf (alist-get key worksneeze--compilation-buffers nil 'remove #'equal) nil)
+      nil)
+     (t nil))))
+
+(defun worksneeze--compilation-status-string (path)
+  "Return a propertized compilation status string for worktree at PATH, or nil."
+  (when-let ((buf (worksneeze--compilation-for-path path)))
+    (let ((proc (get-buffer-process buf)))
+      (if (and proc (process-live-p proc))
+          (propertize "[compile: running]" 'face 'worksneeze-compile-running)
+        (propertize "[compile: done]" 'face 'worksneeze-compile-done)))))
+
+(defun worksneeze--on-compilation-finish (_buf _msg)
+  "Handle compilation finish by scheduling a debounced dashboard refresh."
+  (when (timerp worksneeze--refresh-timer)
+    (cancel-timer worksneeze--refresh-timer))
+  (setq worksneeze--refresh-timer
+        (run-with-timer 0.5 nil #'worksneeze--maybe-refresh)))
+
+(add-hook 'compilation-finish-functions #'worksneeze--on-compilation-finish)
+
+;;; Agent-Shell Integration
 
 (defvar worksneeze--subscribed-buffers nil
   "List of agent-shell buffers we have subscribed to.")
@@ -428,30 +509,67 @@ and re-renders the dashboard when complete."
   "Return non-nil if WORKTREE is the main worktree (the repo root)."
   (string= (file-name-as-directory (alist-get :path worktree)) repo-root))
 
+(defun worksneeze--worktree-status-string (path)
+  "Return a propertized git status string for worktree at PATH."
+  (let ((default-directory (file-name-as-directory path)))
+    (condition-case nil
+        (let ((lines (worksneeze--run-git "status" "--porcelain")))
+          (if (null lines)
+              (propertize "clean" 'face 'worksneeze-clean)
+            (let ((staged 0) (modified 0) (untracked 0))
+              (dolist (line lines)
+                (when (>= (length line) 2)
+                  (let ((x (aref line 0))
+                        (y (aref line 1)))
+                    (cond
+                     ((= x ??) (cl-incf untracked))
+                     ((memq x '(?M ?A ?D ?R ?C)) (cl-incf staged)))
+                    (when (memq y '(?M ?D))
+                      (cl-incf modified)))))
+              (let ((parts nil))
+                (when (> staged 0)
+                  (push (format "%d staged" staged) parts))
+                (when (> modified 0)
+                  (push (format "%d modified" modified) parts))
+                (when (> untracked 0)
+                  (push (format "%d untracked" untracked) parts))
+                (propertize (string-join (nreverse parts) ", ")
+                            'face 'worksneeze-dirty)))))
+      (error (propertize "unknown" 'face 'worksneeze-head)))))
+
 (defun worksneeze--render-worktree-entry (wt repo-root &optional marker)
   "Render a worktree entry for WT in project REPO-ROOT as a multi-line block.
 MARKER is an optional string prefix (e.g. \"*\")."
   (let* ((path (alist-get :path wt))
          (head (alist-get :head wt))
          (branch (alist-get :branch wt))
-         (name (file-name-nondirectory (directory-file-name path)))
-         (branch-str
-          (if branch
-              (propertize branch 'face 'worksneeze-branch)
-            (propertize "(detached)" 'face 'worksneeze-detached)))
+         (display-name (if branch
+                           (propertize branch 'face 'worksneeze-path)
+                         (propertize (file-name-nondirectory (directory-file-name path))
+                                     'face 'worksneeze-path)))
          (head-str
           (propertize (substring head 0 (min 8 (length head)))
                       'face 'worksneeze-head))
+         (status-str (worksneeze--worktree-status-string path))
          (agent-str (worksneeze--agent-status-string path))
+         (compile-str (worksneeze--compilation-status-string path))
          (pr-str (when branch (worksneeze--pr-info-string branch repo-root)))
          (entry-start (point)))
-    (insert (format " %s %s\n" (or marker " ") (propertize name 'face 'worksneeze-path)))
-    (insert (format "     %s  %s" branch-str head-str))
+    (insert (format " %s %s\n"
+                    (if marker
+                        (propertize marker 'face 'worksneeze-main-marker)
+                      " ")
+                    display-name))
+    (when (not branch)
+      (insert "     " (propertize "(detached)" 'face 'worksneeze-detached) "\n"))
+    (insert "     " head-str "  " status-str "\n")
     (when agent-str
-      (insert "  " agent-str))
-    (insert "\n")
+      (insert "     " agent-str "\n"))
+    (when compile-str
+      (insert "     " compile-str "\n"))
     (when pr-str
       (insert "     " pr-str "\n"))
+    (insert "\n")
     (put-text-property entry-start (point) 'worksneeze-path path)
     (put-text-property entry-start (point) 'worksneeze-repo-root repo-root)))
 
@@ -467,15 +585,17 @@ MARKER is an optional string prefix (e.g. \"*\")."
                               worktrees))
          (name (worksneeze--project-display-name repo-root))
          (section-start (point)))
-    (insert (propertize (format "== %s ==" name)
-                        'face 'worksneeze-project-header)
+    (insert (propertize name 'face 'worksneeze-project-header) "\n")
+    (insert (propertize (make-string (max (length name) 20) ?─)
+                        'face 'worksneeze-separator)
             "\n")
     (put-text-property section-start (point) 'worksneeze-repo-root repo-root)
     (when main-wt
       (worksneeze--render-worktree-entry main-wt repo-root "*"))
     (if (null managed)
         (let ((start (point)))
-          (insert "  (no managed worktrees)\n")
+          (insert (propertize "  (no managed worktrees)\n"
+                              'face 'worksneeze-empty))
           (put-text-property start (point) 'worksneeze-repo-root repo-root))
       (dolist (wt managed)
         (worksneeze--render-worktree-entry wt repo-root)))
@@ -512,9 +632,10 @@ Falls back to the project header for ROOT, then to `point-min'."
         (saved-path (get-text-property (point) 'worksneeze-path))
         (saved-root (get-text-property (point) 'worksneeze-repo-root)))
     (erase-buffer)
+    (insert (propertize "Worksneeze" 'face 'worksneeze-header) "\n\n")
     (if (null projects)
         (insert (propertize "No projects with managed worktrees found.\n\n"
-                            'face 'font-lock-comment-face)
+                            'face 'worksneeze-empty)
                 "Press `c' to create a worktree in a project,\n"
                 "or ensure your projects are registered with "
                 (pcase worksneeze-project-backend
@@ -584,6 +705,10 @@ Falls back to the project header for ROOT, then to `point-min'."
     ("c" "New worktree" worksneeze-create)
     ("P" "From PR" worksneeze-create-from-pr)
     ("a" "Open agent" worksneeze-open-agent)]
+   ["Compile"
+    ("s" "Open compilation" worksneeze-open-compilation)
+    ("K" "Kill compilation" worksneeze-kill-compilation)
+    ("R" "Rerun compilation" worksneeze-rerun-compilation)]
    ["Delete"
     ("D" "Mark delete" worksneeze-mark-delete :transient t)
     ("u" "Unmark" worksneeze-unmark :transient t)
@@ -597,6 +722,9 @@ Falls back to the project header for ROOT, then to `point-min'."
     (define-key map (kbd "c")   #'worksneeze-create)
     (define-key map (kbd "P")   #'worksneeze-create-from-pr)
     (define-key map (kbd "a")   #'worksneeze-open-agent)
+    (define-key map (kbd "s")   #'worksneeze-open-compilation)
+    (define-key map (kbd "K")   #'worksneeze-kill-compilation)
+    (define-key map (kbd "R")   #'worksneeze-rerun-compilation)
     (define-key map (kbd "D")   #'worksneeze-mark-delete)
     (define-key map (kbd "u")   #'worksneeze-unmark)
     (define-key map (kbd "x")   #'worksneeze-execute)
@@ -628,6 +756,9 @@ Falls back to the project header for ROOT, then to `point-min'."
       (kbd "c")   #'worksneeze-create
       (kbd "P")   #'worksneeze-create-from-pr
       (kbd "a")   #'worksneeze-open-agent
+      (kbd "s")   #'worksneeze-open-compilation
+      (kbd "K")   #'worksneeze-kill-compilation
+      (kbd "R")   #'worksneeze-rerun-compilation
       (kbd "D")   #'worksneeze-mark-delete
       (kbd "u")   #'worksneeze-unmark
       (kbd "x")   #'worksneeze-execute
@@ -712,6 +843,51 @@ Otherwise start a new agent-shell in the worktree directory."
           (pop-to-buffer (alist-get :buffer (car agents)))
         (let ((default-directory (file-name-as-directory path)))
           (agent-shell))))))
+
+(defun worksneeze-open-compilation ()
+  "Switch to the compilation buffer for the worktree at point."
+  (interactive)
+  (let ((path (get-text-property (point) 'worksneeze-path)))
+    (unless path
+      (user-error "No worktree on this line"))
+    (let ((buf (worksneeze--compilation-for-path path)))
+      (unless buf
+        (user-error "No compilation buffer for this worktree"))
+      (pop-to-buffer buf))))
+
+(defun worksneeze-kill-compilation ()
+  "Kill the running compilation process for the worktree at point."
+  (interactive)
+  (let ((path (get-text-property (point) 'worksneeze-path)))
+    (unless path
+      (user-error "No worktree on this line"))
+    (let ((buf (worksneeze--compilation-for-path path)))
+      (unless buf
+        (user-error "No compilation buffer for this worktree"))
+      (let ((proc (get-buffer-process buf)))
+        (unless (and proc (process-live-p proc))
+          (user-error "No running process in compilation buffer"))
+        (when (y-or-n-p "Kill compilation process? ")
+          (kill-process proc)
+          (message "Compilation process killed"))))))
+
+(defun worksneeze-rerun-compilation ()
+  "Rerun the compilation for the worktree at point.
+Kills any running process first, then recompiles."
+  (interactive)
+  (let ((path (get-text-property (point) 'worksneeze-path)))
+    (unless path
+      (user-error "No worktree on this line"))
+    (let ((buf (worksneeze--compilation-for-path path)))
+      (unless buf
+        (user-error "No compilation buffer for this worktree"))
+      (with-current-buffer buf
+        (let ((proc (get-buffer-process buf)))
+          (when (and proc (process-live-p proc))
+            (kill-process proc)
+            (while (process-live-p proc)
+              (sit-for 0.1))))
+        (recompile)))))
 
 (defun worksneeze-open-pr ()
   "Open the GitHub PR for the worktree at point in the browser."
