@@ -57,8 +57,8 @@
   "Whether to use magit for opening worktrees.
 `auto' uses magit when available; t forces it; nil always uses dired."
   :type '(choice (const :tag "Auto-detect" auto)
-                 (const :tag "Always use magit" t)
-                 (const :tag "Always use dired" nil))
+          (const :tag "Always use magit" t)
+          (const :tag "Always use dired" nil))
   :group 'worksneeze)
 
 (defcustom worksneeze-project-backend 'auto
@@ -68,9 +68,9 @@
 `project' uses `project-known-project-roots'.
 `custom' uses `worksneeze-custom-project-roots'."
   :type '(choice (const :tag "Auto-detect" auto)
-                 (const :tag "Projectile" projectile)
-                 (const :tag "project.el" project)
-                 (const :tag "Custom list" custom))
+          (const :tag "Projectile" projectile)
+          (const :tag "project.el" project)
+          (const :tag "Custom list" custom))
   :group 'worksneeze)
 
 (defcustom worksneeze-custom-project-roots nil
@@ -316,11 +316,18 @@ git repo root."
 (defvar worksneeze--compilation-buffers nil
   "Alist mapping worktree path strings to compilation buffers.")
 
+(defvar worksneeze--compilation-commands nil
+  "Alist mapping worktree path strings to their last compilation command.")
+
 (defun worksneeze-register-compilation (wt-path buffer)
   "Associate compilation BUFFER with worktree at WT-PATH.
 External packages call this after starting a compilation in a worktree."
   (let ((key (file-name-as-directory wt-path)))
-    (setf (alist-get key worksneeze--compilation-buffers nil nil #'equal) buffer)))
+    (setf (alist-get key worksneeze--compilation-buffers nil nil #'equal) buffer)
+    (when (buffer-live-p buffer)
+      (let ((cmd (buffer-local-value 'compile-command buffer)))
+        (when cmd
+          (setf (alist-get key worksneeze--compilation-commands nil nil #'equal) cmd))))))
 
 (defun worksneeze--compilation-for-path (path)
   "Return the compilation buffer for worktree at PATH, or nil.
@@ -336,11 +343,16 @@ Cleans up stale entries for dead buffers."
 
 (defun worksneeze--compilation-status-string (path)
   "Return a propertized compilation status string for worktree at PATH, or nil."
-  (when-let ((buf (worksneeze--compilation-for-path path)))
-    (let ((proc (get-buffer-process buf)))
-      (if (and proc (process-live-p proc))
-          (propertize "[compile: running]" 'face 'worksneeze-compile-running)
-        (propertize "[compile: done]" 'face 'worksneeze-compile-done)))))
+  (let ((buf (worksneeze--compilation-for-path path)))
+    (cond
+     (buf
+      (let ((proc (get-buffer-process buf)))
+        (if (and proc (process-live-p proc))
+            (propertize "[compile: running]" 'face 'worksneeze-compile-running)
+          (propertize "[compile: done]" 'face 'worksneeze-compile-done))))
+     ((alist-get (file-name-as-directory path) worksneeze--compilation-commands
+                 nil nil #'equal)
+      (propertize "[compile: killed]" 'face 'worksneeze-compile-done)))))
 
 (defun worksneeze--on-compilation-finish (_buf _msg)
   "Handle compilation finish by scheduling a debounced dashboard refresh."
@@ -873,21 +885,27 @@ Otherwise start a new agent-shell in the worktree directory."
 
 (defun worksneeze-rerun-compilation ()
   "Rerun the compilation for the worktree at point.
-Kills any running process first, then recompiles."
+Kills any running process first, then recompiles.  If the compilation
+buffer has been killed, re-creates it using the saved command."
   (interactive)
   (let ((path (get-text-property (point) 'worksneeze-path)))
     (unless path
       (user-error "No worktree on this line"))
     (let ((buf (worksneeze--compilation-for-path path)))
-      (unless buf
-        (user-error "No compilation buffer for this worktree"))
-      (with-current-buffer buf
-        (let ((proc (get-buffer-process buf)))
-          (when (and proc (process-live-p proc))
-            (kill-process proc)
-            (while (process-live-p proc)
-              (sit-for 0.1))))
-        (recompile)))))
+      (if buf
+          (with-current-buffer buf
+            (let ((proc (get-buffer-process buf)))
+              (when (and proc (process-live-p proc))
+                (kill-process proc)
+                (while (process-live-p proc)
+                  (sit-for 0.1))))
+            (recompile))
+        (let* ((key (file-name-as-directory path))
+               (cmd (alist-get key worksneeze--compilation-commands nil nil #'equal)))
+          (unless cmd
+            (user-error "No compilation buffer or saved command for this worktree"))
+          (let ((default-directory (file-name-as-directory path)))
+            (worksneeze-register-compilation path (compile cmd))))))))
 
 (defun worksneeze-open-pr ()
   "Open the GitHub PR for the worktree at point in the browser."
@@ -1020,7 +1038,7 @@ The mark column is at column 1 on the header line of the entry."
 (defun worksneeze--ensure-worktrees-ignored (root)
   "Ensure the worktree directory is in ROOT's .gitignore."
   (let ((gitignore (expand-file-name ".gitignore" root))
-        (entry (concat "/" worksneeze-worktree-directory)))
+        (entry (concat worksneeze-worktree-directory "/")))
     (unless (and (file-exists-p gitignore)
                  (with-temp-buffer
                    (insert-file-contents gitignore)
