@@ -728,26 +728,34 @@ Falls back to the project header for ROOT, then to `point-min'."
    ["Other"
     ("q" "Quit" quit-window)]])
 
+(defconst worksneeze--bindings
+  '(("g"         . worksneeze-refresh)
+    ("c"         . worksneeze-create)
+    ("P"         . worksneeze-create-from-pr)
+    ("a"         . worksneeze-open-agent)
+    ("s"         . worksneeze-open-compilation)
+    ("K"         . worksneeze-kill-compilation)
+    ("R"         . worksneeze-rerun-compilation)
+    ("D"         . worksneeze-mark-delete)
+    ("u"         . worksneeze-unmark)
+    ("x"         . worksneeze-execute)
+    ("RET"       . worksneeze-open-at-point)
+    ("o"         . worksneeze-open-pr)
+    ("q"         . quit-window)
+    ("TAB"       . worksneeze-next-project)
+    ("<backtab>" . worksneeze-prev-project)
+    ("?"         . worksneeze-menu))
+  "Shared key bindings for `worksneeze-mode'.
+Applied to both the regular keymap and the evil auxiliary keymap.
+Does not include n/p, which are only bound for non-evil users.")
+
 (defconst worksneeze-mode-map
   (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "g")   #'worksneeze-refresh)
-    (define-key map (kbd "c")   #'worksneeze-create)
-    (define-key map (kbd "P")   #'worksneeze-create-from-pr)
-    (define-key map (kbd "a")   #'worksneeze-open-agent)
-    (define-key map (kbd "s")   #'worksneeze-open-compilation)
-    (define-key map (kbd "K")   #'worksneeze-kill-compilation)
-    (define-key map (kbd "R")   #'worksneeze-rerun-compilation)
-    (define-key map (kbd "D")   #'worksneeze-mark-delete)
-    (define-key map (kbd "u")   #'worksneeze-unmark)
-    (define-key map (kbd "x")   #'worksneeze-execute)
-    (define-key map (kbd "RET") #'worksneeze-open-at-point)
-    (define-key map (kbd "o")   #'worksneeze-open-pr)
-    (define-key map (kbd "q")   #'quit-window)
-    (define-key map (kbd "n")   #'next-line)
-    (define-key map (kbd "p")   #'previous-line)
-    (define-key map (kbd "TAB")       #'worksneeze-next-project)
-    (define-key map (kbd "<backtab>") #'worksneeze-prev-project)
-    (define-key map (kbd "?")   #'worksneeze-menu)
+    (dolist (b worksneeze--bindings)
+      (define-key map (kbd (car b)) (cdr b)))
+    ;; n/p for non-evil users; evil users keep evil's own n/p behavior
+    (define-key map (kbd "n") #'next-line)
+    (define-key map (kbd "p") #'previous-line)
     map)
   "Keymap for `worksneeze-mode'.")
 
@@ -763,23 +771,9 @@ Falls back to the project header for ROOT, then to `point-min'."
   ;; put our bindings on the mode's evil auxiliary keymap via
   ;; `evil-define-key*' so they take priority over the remaps.
   (when (bound-and-true-p evil-mode)
-    (evil-define-key* 'normal worksneeze-mode-map
-      (kbd "g")   #'worksneeze-refresh
-      (kbd "c")   #'worksneeze-create
-      (kbd "P")   #'worksneeze-create-from-pr
-      (kbd "a")   #'worksneeze-open-agent
-      (kbd "s")   #'worksneeze-open-compilation
-      (kbd "K")   #'worksneeze-kill-compilation
-      (kbd "R")   #'worksneeze-rerun-compilation
-      (kbd "D")   #'worksneeze-mark-delete
-      (kbd "u")   #'worksneeze-unmark
-      (kbd "x")   #'worksneeze-execute
-      (kbd "RET") #'worksneeze-open-at-point
-      (kbd "o")   #'worksneeze-open-pr
-      (kbd "q")   #'quit-window
-      (kbd "TAB")       #'worksneeze-next-project
-      (kbd "<backtab>") #'worksneeze-prev-project
-      (kbd "?")   #'worksneeze-menu)))
+    (apply #'evil-define-key* 'normal worksneeze-mode-map
+           (mapcan (lambda (b) (list (kbd (car b)) (cdr b)))
+                   worksneeze--bindings))))
 
 ;;; Entry Points
 
