@@ -3,6 +3,10 @@
 
 An Emacs package for managing git worktrees across all your projects.
 
+#+begin_quote
+*Note:* VibeCode Alert -- The code in this package was generated entirely by an LLM.
+#+end_quote
+
 * Overview
 
 worksneeze provides a cross-project dashboard for viewing and managing git worktrees. It discovers all known projects (via projectile or project.el), finds the ones that have worksneeze-managed worktrees, and shows them grouped by project in a single buffer.
