@@ -777,21 +777,26 @@ Does not include n/p, which are only bound for non-evil users.")
 
 ;;; Entry Points
 
+(defun worksneeze--collect-roots ()
+  "Return deduplicated list of project roots to show in the dashboard.
+Merges all projects that have a managed worktree directory with the
+repo root of `default-directory' (if it also has one)."
+  (let* ((discovered (worksneeze--projects-with-worksneeze))
+         (current-root (worksneeze--repo-root-for default-directory)))
+    (delete-dups
+     (append discovered
+             (when (and current-root
+                        (worksneeze--has-managed-dir-p current-root))
+               (list current-root))))))
+
 ;;;###autoload
 (defun worksneeze ()
   "Open the worksneeze cross-project worktree dashboard."
   (interactive)
-  (let* ((discovered (worksneeze--projects-with-worksneeze))
-         (current-root (worksneeze--repo-root-for default-directory))
-         (all-roots (delete-dups
-                     (append discovered
-                             (when (and current-root
-                                        (worksneeze--has-managed-dir-p current-root))
-                               (list current-root)))))
-         (buf (get-buffer-create worksneeze-buffer-name)))
+  (let ((buf (get-buffer-create worksneeze-buffer-name)))
     (with-current-buffer buf
       (worksneeze-mode)
-      (setq-local worksneeze--project-roots all-roots)
+      (setq-local worksneeze--project-roots (worksneeze--collect-roots))
       (worksneeze--render))
     (pop-to-buffer buf)))
 
@@ -800,13 +805,7 @@ Does not include n/p, which are only bound for non-evil users.")
   (interactive)
   (unless (derived-mode-p 'worksneeze-mode)
     (user-error "Not in a worksneeze buffer"))
-  (let* ((discovered (worksneeze--projects-with-worksneeze))
-         (current-root (worksneeze--repo-root-for default-directory))
-         (all-roots (delete-dups
-                     (append discovered
-                             (when (and current-root
-                                        (worksneeze--has-managed-dir-p current-root))
-                               (list current-root))))))
+  (let ((all-roots (worksneeze--collect-roots)))
     (setq-local worksneeze--project-roots all-roots)
     (setq worksneeze--pr-data nil)
     (setq worksneeze--pr-fetch-in-progress nil)
