@@ -1,47 +1,112 @@
 #+title: worksneeze
 #+author: Aaron Strick
 
-An Emacs package for managing git worktrees.
+An Emacs package for managing git worktrees across all your projects.
 
 * Overview
 
-worksneeze provides a dashboard buffer for viewing and managing git worktrees, with a focus on worktrees it creates itself (stored in a =.worktrees/= subdirectory of the repo root).
+worksneeze provides a cross-project dashboard for viewing and managing git worktrees. It discovers all known projects (via projectile or project.el), finds the ones that have worksneeze-managed worktrees, and shows them grouped by project in a single buffer.
+
+Worktrees are stored in a =.worksneeze/= subdirectory under each project's repo root.
 
 * Features
 
-- *Dashboard* (~M-x worksneeze~): Lists all worksneeze-managed worktrees with branch and commit info. The main worktree is shown with a =*= marker.
-- *Create* (~c~ in dashboard, or ~M-x worksneeze-create~): Creates a new worktree + branch under =.worktrees/=. Use ~C-u~ prefix to specify a base branch/commit.
-- *Delete* (dired-style): Mark worktrees with ~D~, unmark with ~u~, execute deletions with ~x~.
-- *Open* (~RET~ in dashboard): Opens the worktree at point in magit (if available) or dired.
+- *Dashboard* (~M-x worksneeze~): Lists managed worktrees across all known projects, grouped by repo. Shows branch, HEAD SHA, git status, and optionally PR info, agent status, and compilation status.
+- *Create* (~c~ in dashboard, or ~M-x worksneeze-create~): Creates a new worktree under =.worksneeze/=. Offers completion from remote branches; free-form input creates a new branch. ~C-u~ prefix prompts for a base branch/commit.
+- *Create from PR* (~P~ in dashboard, or ~M-x worksneeze-create-from-pr~): Resolves a GitHub PR URL via the =gh= CLI and creates a tracking worktree for it.
+- *Delete* (dired-style): Mark worktrees with ~D~, unmark with ~u~, execute with ~x~.
+- *Open* (~RET~): Opens the worktree at point in magit (if available) or dired.
 
 * Dashboard Keybindings
 
-| Key   | Action                    |
-|-------+---------------------------|
-| =g=   | Refresh                   |
-| =c=   | Create new worktree       |
-| =D=   | Mark for deletion         |
-| =u=   | Unmark                    |
-| =x=   | Execute pending deletions |
-| =RET= | Open worktree             |
-| =q=   | Quit                      |
-| =n/p= | Navigate lines            |
+Press ~?~ in the dashboard for a full transient menu. Common bindings:
+
+| Key       | Action                       |
+|-----------+------------------------------|
+| =RET=     | Open worktree                |
+| =c=       | Create new worktree          |
+| =P=       | Create worktree from PR URL  |
+| =D=       | Mark for deletion            |
+| =u=       | Unmark                       |
+| =x=       | Execute pending deletions    |
+| =g=       | Refresh                      |
+| =o=       | Open PR in browser           |
+| =a=       | Open/start agent-shell       |
+| =s=       | Open compilation buffer      |
+| =K=       | Kill compilation process     |
+| =R=       | Rerun compilation            |
+| =n= / =p= | Navigate lines               |
+| =TAB=     | Jump to next project         |
+| =S-TAB=   | Jump to previous project     |
+| =?=       | Help menu                    |
+| =q=       | Quit                         |
 
 * Installation
 
-Add the package to your load path and require it:
+worksneeze is not yet on MELPA. Install it directly from this repo.
+
+With =straight.el=:
 
 #+begin_src emacs-lisp
+(straight-use-package
+ '(worksneeze :type git :host github :repo "strickinato/worksneeze"))
+#+end_src
+
+With =use-package= + =straight.el=:
+
+#+begin_src emacs-lisp
+(use-package worksneeze
+  :straight (:host github :repo "strickinato/worksneeze"))
+#+end_src
+
+Or clone the repo and add it to your load path manually:
+
+#+begin_src emacs-lisp
+(add-to-list 'load-path "/path/to/worksneeze")
 (require 'worksneeze)
 #+end_src
 
 * Customization
 
-- ~worksneeze-worktree-directory~ (default =".worktrees"=): Subdirectory under the repo root where new worktrees are placed.
+- ~worksneeze-worktree-directory~ (default =".worksneeze"=): Subdirectory under the repo root where new worktrees are placed.
 - ~worksneeze-buffer-name~ (default ="*worksneeze*"=): Dashboard buffer name.
-- ~worksneeze-use-magit~ (default ='auto=): Controls whether ~RET~ opens magit-status or dired. Options: =auto=, =t=, =nil=.
+- ~worksneeze-use-magit~ (default ='auto=): Controls whether ~RET~ opens magit or dired. Options: =auto=, =t=, =nil=.
+- ~worksneeze-project-backend~ (default ='auto=): How to discover known projects. Options: =auto= (tries projectile, then project.el), =projectile=, =project=, =custom=.
+- ~worksneeze-custom-project-roots~: List of project root directories used when ~worksneeze-project-backend~ is ='custom=.
+
+* Hooks
+
+- ~worksneeze-after-create-functions~: Abnormal hook run after a worktree is created. Each function receives two arguments: the new worktree path and the repo root.
+
+* Optional Integrations
+
+** magit
+If magit is installed, ~RET~ opens the worktree with ~magit-status~. Controlled by ~worksneeze-use-magit~.
+
+** GitHub PR integration (ghub)
+If [[https://github.com/magit/ghub][ghub]] is installed and configured with forge auth, the dashboard fetches open PRs for each GitHub-hosted project and displays PR title and number next to the matching worktree. ~o~ opens the PR in the browser.
+
+** GitHub PR creation (gh CLI)
+~worksneeze-create-from-pr~ requires the [[https://cli.github.com/][gh CLI]] to be installed and authenticated (~gh auth login~).
+
+** agent-shell
+If [[https://github.com/xenodium/agent-shell][agent-shell]] is installed, the dashboard shows agent status (idle/busy) per worktree. ~a~ opens an existing agent buffer for the worktree at point or starts a new one.
+
+** Compilation tracking
+External packages can associate a compilation buffer with a worktree by calling ~worksneeze-register-compilation~:
+
+#+begin_src emacs-lisp
+(worksneeze-register-compilation worktree-path compilation-buffer)
+#+end_src
+
+The dashboard will then show compile status (running/done) for that worktree, and ~s~/~K~/~R~ can open, kill, or rerun it.
 
 * Dependencies
 
 - Emacs 27.1+
-- magit (optional, for opening worktrees with ~magit-status~)
+- [[https://github.com/magit/transient][transient]] (required)
+- magit (optional)
+- ghub (optional, for PR display)
+- projectile or project.el (optional, for project discovery)
+- =gh= CLI (optional, for ~worksneeze-create-from-pr~)
+- agent-shell (optional)
