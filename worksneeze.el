@@ -2,7 +2,7 @@
 
 ;; Author: Aaron Strick
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "27.1"))
+;; Package-Requires: ((emacs "27.1") (transient "0.3.0"))
 ;; Keywords: git, vc, tools
 ;; URL: https://github.com/strickinato/worksneeze
 
