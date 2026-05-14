@@ -22,7 +22,7 @@
 (require 'transient)
 (require 'ghub nil t)
 
-(declare-function magit-status "magit-status" (&optional directory))
+(declare-function magit-status-setup-buffer "magit-status" (&optional directory))
 (declare-function evil-define-key* "evil-core" (state keymap &rest bindings))
 (declare-function projectile-add-known-project "projectile" (project-root))
 (declare-function projectile-remove-known-project "projectile" (&optional project))
@@ -818,7 +818,7 @@ Does not include n/p, which are only bound for non-evil users.")
 (defun worksneeze--use-magit-p ()
   "Return non-nil if magit should be used to open worktrees."
   (pcase worksneeze-use-magit
-    ('auto (and (featurep 'magit) (fboundp 'magit-status)))
+    ('auto (and (featurep 'magit) (fboundp 'magit-status-setup-buffer)))
     ('t t)
     (_ nil)))
 
@@ -831,7 +831,7 @@ Does not include n/p, which are only bound for non-evil users.")
     (unless (file-directory-p path)
       (user-error "Worktree directory does not exist: %s" path))
     (if (worksneeze--use-magit-p)
-        (magit-status path)
+        (magit-status-setup-buffer path)
       (dired path))))
 
 (defun worksneeze-open-agent ()
@@ -1151,7 +1151,7 @@ REPO-ROOT specifies which project to create the worktree in."
           (worksneeze-refresh)))
       (run-hook-with-args 'worksneeze-after-create-functions wt-path root)
       (if (worksneeze--use-magit-p)
-          (magit-status wt-path)
+          (magit-status-setup-buffer wt-path)
         (dired wt-path)))))
 
 ;;;###autoload
