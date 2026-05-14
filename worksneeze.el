@@ -20,6 +20,7 @@
 ;;; Code:
 
 (require 'transient)
+(require 'comint)
 (require 'ghub nil t)
 
 (declare-function magit-status-setup-buffer "magit-status" (&optional directory))
@@ -28,7 +29,6 @@
 (declare-function projectile-remove-known-project "projectile" (&optional project))
 (declare-function project-known-project-roots "project" ())
 (defvar projectile-known-projects)
-(declare-function recompile "compile" (&optional edit-command))
 (declare-function agent-shell "agent-shell" (&optional prefix))
 (declare-function agent-shell-buffers "agent-shell" ())
 (declare-function agent-shell-cwd "agent-shell-project" ())
@@ -283,14 +283,14 @@ git repo root."
   "Face for draft PR indicator."
   :group 'worksneeze)
 
-(defface worksneeze-compile-running
+(defface worksneeze-process-running
   '((t :inherit success :weight bold))
-  "Face for running compilation indicator."
+  "Face for a running process indicator."
   :group 'worksneeze)
 
-(defface worksneeze-compile-done
+(defface worksneeze-process-stopped
   '((t :inherit font-lock-comment-face))
-  "Face for finished compilation indicator."
+  "Face for a stopped process indicator."
   :group 'worksneeze)
 
 (defface worksneeze-clean
@@ -311,57 +311,84 @@ git repo root."
 (defvar worksneeze--refresh-timer nil
   "Debounce timer for dashboard refresh.")
 
-;;; Compilation Buffer Integration
+;;; Process Buffer Integration
 
-(defvar worksneeze--compilation-buffers nil
-  "Alist mapping worktree path strings to compilation buffers.")
+(defvar worksneeze--process-buffers nil
+  "Alist mapping worktree path strings to comint process buffers.")
 
-(defvar worksneeze--compilation-commands nil
-  "Alist mapping worktree path strings to their last compilation command.")
+(defun worksneeze--cmd-file-for (wt-path)
+  "Return the path to the shared worksneeze-cmd file for WT-PATH's project.
+The file lives in the .worksneeze/ directory (parent of WT-PATH), so it
+is automatically covered by the project's existing .gitignore entry."
+  (expand-file-name "worksneeze-cmd"
+                    (file-name-directory (directory-file-name wt-path))))
 
-(defun worksneeze-register-compilation (wt-path buffer)
-  "Associate compilation BUFFER with worktree at WT-PATH.
-External packages call this after starting a compilation in a worktree."
-  (let ((key (file-name-as-directory wt-path)))
-    (setf (alist-get key worksneeze--compilation-buffers nil nil #'equal) buffer)
-    (when (buffer-live-p buffer)
-      (let ((cmd (buffer-local-value 'compile-command buffer)))
-        (when cmd
-          (setf (alist-get key worksneeze--compilation-commands nil nil #'equal) cmd))))))
+(defun worksneeze--read-cmd-table (cmd-file)
+  "Read the command alist from CMD-FILE, or nil if absent or malformed."
+  (when (file-exists-p cmd-file)
+    (condition-case nil
+        (with-temp-buffer
+          (insert-file-contents cmd-file)
+          (read (current-buffer)))
+      (error nil))))
 
-(defun worksneeze--compilation-for-path (path)
-  "Return the compilation buffer for worktree at PATH, or nil.
+(defun worksneeze--save-cmd (wt-path command)
+  "Persist COMMAND for WT-PATH in the project's worksneeze-cmd file."
+  (let* ((cmd-file (worksneeze--cmd-file-for wt-path))
+         (name (file-name-nondirectory (directory-file-name wt-path)))
+         (table (worksneeze--read-cmd-table cmd-file)))
+    (setf (alist-get name table nil nil #'equal) command)
+    (with-temp-buffer
+      (pp table (current-buffer))
+      (write-region (point-min) (point-max) cmd-file nil 'silent))))
+
+(defun worksneeze--load-cmd (wt-path)
+  "Return the saved command for WT-PATH from the worksneeze-cmd file, or nil."
+  (let* ((cmd-file (worksneeze--cmd-file-for wt-path))
+         (name (file-name-nondirectory (directory-file-name wt-path))))
+    (alist-get name (worksneeze--read-cmd-table cmd-file) nil nil #'equal)))
+
+(defun worksneeze-start-process (wt-path command)
+  "Start COMMAND as a comint process for the worktree at WT-PATH.
+Persists COMMAND to the project's .worksneeze/worksneeze-cmd file for
+later reuse.  Intended to be called from `worksneeze-after-create-functions'."
+  (let* ((key (file-name-as-directory wt-path))
+         (name (file-name-nondirectory (directory-file-name wt-path)))
+         (buf-name (format "*worksneeze: %s*" name))
+         (default-directory (file-name-as-directory wt-path))
+         (buf (get-buffer-create buf-name)))
+    (worksneeze--save-cmd wt-path command)
+    (when-let ((proc (get-buffer-process buf)))
+      (when (process-live-p proc)
+        (kill-process proc)))
+    (with-current-buffer buf (comint-mode))
+    (comint-exec buf name shell-file-name nil (list "--login" "-c" command))
+    (setf (alist-get key worksneeze--process-buffers nil nil #'equal) buf)
+    buf))
+
+(defun worksneeze--process-for-path (path)
+  "Return the process buffer for worktree at PATH, or nil.
 Cleans up stale entries for dead buffers."
   (let* ((key (file-name-as-directory path))
-         (buf (alist-get key worksneeze--compilation-buffers nil nil #'equal)))
+         (buf (alist-get key worksneeze--process-buffers nil nil #'equal)))
     (cond
      ((and buf (buffer-live-p buf)) buf)
      (buf
-      (setf (alist-get key worksneeze--compilation-buffers nil 'remove #'equal) nil)
+      (setf (alist-get key worksneeze--process-buffers nil 'remove #'equal) nil)
       nil)
      (t nil))))
 
-(defun worksneeze--compilation-status-string (path)
-  "Return a propertized compilation status string for worktree at PATH, or nil."
-  (let ((buf (worksneeze--compilation-for-path path)))
+(defun worksneeze--process-status-string (path)
+  "Return a propertized process status string for worktree at PATH, or nil."
+  (let ((buf (worksneeze--process-for-path path)))
     (cond
-     (buf
-      (let ((proc (get-buffer-process buf)))
-        (if (and proc (process-live-p proc))
-            (propertize "[compile: running]" 'face 'worksneeze-compile-running)
-          (propertize "[compile: done]" 'face 'worksneeze-compile-done))))
-     ((alist-get (file-name-as-directory path) worksneeze--compilation-commands
-                 nil nil #'equal)
-      (propertize "[compile: killed]" 'face 'worksneeze-compile-done)))))
-
-(defun worksneeze--on-compilation-finish (_buf _msg)
-  "Handle compilation finish by scheduling a debounced dashboard refresh."
-  (when (timerp worksneeze--refresh-timer)
-    (cancel-timer worksneeze--refresh-timer))
-  (setq worksneeze--refresh-timer
-        (run-with-timer 0.5 nil #'worksneeze--maybe-refresh)))
-
-(add-hook 'compilation-finish-functions #'worksneeze--on-compilation-finish)
+     ((and buf (buffer-live-p buf))
+      (if (process-live-p (get-buffer-process buf))
+          (propertize "[process: running]" 'face 'worksneeze-process-running)
+        (propertize "[process: stopped]" 'face 'worksneeze-process-stopped)))
+     ((worksneeze--load-cmd path)
+      (propertize "[process: not started]" 'face 'worksneeze-process-stopped))
+     (t nil))))
 
 ;;; Agent-Shell Integration
 
@@ -564,7 +591,7 @@ MARKER is an optional string prefix (e.g. \"*\")."
                       'face 'worksneeze-head))
          (status-str (worksneeze--worktree-status-string path))
          (agent-str (worksneeze--agent-status-string path))
-         (compile-str (worksneeze--compilation-status-string path))
+         (compile-str (worksneeze--process-status-string path))
          (pr-str (when branch (worksneeze--pr-info-string branch repo-root)))
          (entry-start (point)))
     (insert (format " %s %s\n"
@@ -717,10 +744,10 @@ Falls back to the project header for ROOT, then to `point-min'."
     ("c" "New worktree" worksneeze-create)
     ("P" "From PR" worksneeze-create-from-pr)
     ("a" "Open agent" worksneeze-open-agent)]
-   ["Compile"
-    ("s" "Open compilation" worksneeze-open-compilation)
-    ("K" "Kill compilation" worksneeze-kill-compilation)
-    ("R" "Rerun compilation" worksneeze-rerun-compilation)]
+   ["Process"
+    ("s" "Open process buffer" worksneeze-open-process)
+    ("K" "Kill process" worksneeze-kill-process)
+    ("R" "Rerun process" worksneeze-rerun-process)]
    ["Delete"
     ("D" "Mark delete" worksneeze-mark-delete :transient t)
     ("u" "Unmark" worksneeze-unmark :transient t)
@@ -733,9 +760,9 @@ Falls back to the project header for ROOT, then to `point-min'."
     ("c"         . worksneeze-create)
     ("P"         . worksneeze-create-from-pr)
     ("a"         . worksneeze-open-agent)
-    ("s"         . worksneeze-open-compilation)
-    ("K"         . worksneeze-kill-compilation)
-    ("R"         . worksneeze-rerun-compilation)
+    ("s"         . worksneeze-open-process)
+    ("K"         . worksneeze-kill-process)
+    ("R"         . worksneeze-rerun-process)
     ("D"         . worksneeze-mark-delete)
     ("u"         . worksneeze-unmark)
     ("x"         . worksneeze-execute)
@@ -849,56 +876,46 @@ Otherwise start a new agent-shell in the worktree directory."
         (let ((default-directory (file-name-as-directory path)))
           (agent-shell))))))
 
-(defun worksneeze-open-compilation ()
-  "Switch to the compilation buffer for the worktree at point."
+(defun worksneeze-open-process ()
+  "Switch to the process buffer for the worktree at point."
   (interactive)
   (let ((path (get-text-property (point) 'worksneeze-path)))
     (unless path
       (user-error "No worktree on this line"))
-    (let ((buf (worksneeze--compilation-for-path path)))
+    (let ((buf (worksneeze--process-for-path path)))
       (unless buf
-        (user-error "No compilation buffer for this worktree"))
+        (user-error "No process buffer for this worktree"))
       (pop-to-buffer buf))))
 
-(defun worksneeze-kill-compilation ()
-  "Kill the running compilation process for the worktree at point."
+(defun worksneeze-kill-process ()
+  "Kill the running process for the worktree at point."
   (interactive)
   (let ((path (get-text-property (point) 'worksneeze-path)))
     (unless path
       (user-error "No worktree on this line"))
-    (let ((buf (worksneeze--compilation-for-path path)))
+    (let ((buf (worksneeze--process-for-path path)))
       (unless buf
-        (user-error "No compilation buffer for this worktree"))
+        (user-error "No process buffer for this worktree"))
       (let ((proc (get-buffer-process buf)))
         (unless (and proc (process-live-p proc))
-          (user-error "No running process in compilation buffer"))
-        (when (y-or-n-p "Kill compilation process? ")
+          (user-error "No running process for this worktree"))
+        (when (y-or-n-p "Kill process? ")
           (kill-process proc)
-          (message "Compilation process killed"))))))
+          (message "Process killed"))))))
 
-(defun worksneeze-rerun-compilation ()
-  "Rerun the compilation for the worktree at point.
-Kills any running process first, then recompiles.  If the compilation
-buffer has been killed, re-creates it using the saved command."
+(defun worksneeze-rerun-process ()
+  "Rerun the process for the worktree at point.
+Kills any running process first, then relaunches using the saved
+.worksneeze-cmd file in the worktree directory."
   (interactive)
   (let ((path (get-text-property (point) 'worksneeze-path)))
     (unless path
       (user-error "No worktree on this line"))
-    (let ((buf (worksneeze--compilation-for-path path)))
-      (if buf
-          (with-current-buffer buf
-            (let ((proc (get-buffer-process buf)))
-              (when (and proc (process-live-p proc))
-                (kill-process proc)
-                (while (process-live-p proc)
-                  (sit-for 0.1))))
-            (recompile))
-        (let* ((key (file-name-as-directory path))
-               (cmd (alist-get key worksneeze--compilation-commands nil nil #'equal)))
-          (unless cmd
-            (user-error "No compilation buffer or saved command for this worktree"))
-          (let ((default-directory (file-name-as-directory path)))
-            (worksneeze-register-compilation path (compile cmd))))))))
+    (let ((command (worksneeze--load-cmd path)))
+      (unless command
+        (user-error "No saved command for this worktree"))
+      (worksneeze-start-process path command)
+      (worksneeze--maybe-refresh))))
 
 (defun worksneeze-open-pr ()
   "Open the GitHub PR for the worktree at point in the browser."
