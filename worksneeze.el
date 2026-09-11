@@ -48,6 +48,13 @@
   :type 'string
   :group 'worksneeze)
 
+(defcustom worksneeze-exclude-worktree-directory t
+  "Whether to add the worktree directory to Git's local excludes.
+When non-nil, worktree creation adds `worksneeze-worktree-directory' to
+the repository's common info/exclude file.  This never modifies .gitignore."
+  :type 'boolean
+  :group 'worksneeze)
+
 (defcustom worksneeze-buffer-name "*worksneeze*"
   "Name of the worksneeze dashboard buffer."
   :type 'string
@@ -78,6 +85,13 @@
   :type '(repeat directory)
   :group 'worksneeze)
 
+(defcustom worksneeze-registered-project-roots nil
+  "Project roots included in the worksneeze dashboard.
+Projects opt in to dashboard management by being added to this list,
+either through customization or `worksneeze-register-project'."
+  :type '(repeat directory)
+  :group 'worksneeze)
+
 ;;; Variables
 
 (defvar worksneeze-after-create-functions nil
@@ -87,6 +101,15 @@ worktree directory) and REPO-ROOT (the repository root).")
 
 (defvar-local worksneeze--project-roots nil
   "List of repo root directories shown in the current dashboard.")
+
+(defvar-local worksneeze--load-timer nil
+  "Timer used to load a newly opened dashboard after it is displayed.")
+
+(defvar-local worksneeze--status-cache nil
+  "Hash table mapping worktree paths to porcelain status output.")
+
+(defvar-local worksneeze--status-processes nil
+  "Hash table mapping worktree paths to running status processes.")
 
 
 ;;; Git Data Layer
@@ -179,20 +202,45 @@ Dispatches based on `worksneeze-project-backend'."
   "Return non-nil if REPO-ROOT contains a worksneeze-managed worktree directory."
   (file-directory-p (expand-file-name worksneeze-worktree-directory repo-root)))
 
-(defun worksneeze--projects-with-worksneeze ()
-  "Return a deduplicated list of repo roots that have managed worktree directories.
-Scans all known projects via the project backend and resolves each to its
-git repo root."
-  (let ((project-dirs (worksneeze--discover-project-roots))
+(defun worksneeze--registered-projects ()
+  "Return normalized, deduplicated registered Git repository roots."
+  (let ((project-dirs worksneeze-registered-project-roots)
         (seen (make-hash-table :test #'equal))
         (result nil))
     (dolist (dir project-dirs)
-      (when-let ((repo-root (worksneeze--repo-root-for dir)))
+      (when-let* ((repo-root (worksneeze--repo-root-for
+                              (file-name-as-directory (expand-file-name dir)))))
         (unless (gethash repo-root seen)
           (puthash repo-root t seen)
-          (when (worksneeze--has-managed-dir-p repo-root)
-            (push repo-root result)))))
+          (push repo-root result))))
     (nreverse result)))
+
+;;;###autoload
+(defun worksneeze-register-project (directory)
+  "Register the Git project containing DIRECTORY with worksneeze."
+  (interactive (list (read-directory-name "Register project: "
+                                           default-directory nil t)))
+  (let ((root (worksneeze--repo-root-for directory)))
+    (unless root
+      (user-error "Not inside a Git repository: %s" directory))
+    (cl-pushnew root worksneeze-registered-project-roots :test #'equal)
+    (when (called-interactively-p 'interactive)
+      (message "Registered %s with worksneeze" root))
+    root))
+
+;;;###autoload
+(defun worksneeze-unregister-project (directory)
+  "Remove the Git project containing DIRECTORY from worksneeze."
+  (interactive (list (read-directory-name "Unregister project: "
+                                           default-directory nil t)))
+  (let ((root (worksneeze--repo-root-for directory)))
+    (unless root
+      (user-error "Not inside a Git repository: %s" directory))
+    (setq worksneeze-registered-project-roots
+          (delete root worksneeze-registered-project-roots))
+    (when (called-interactively-p 'interactive)
+      (message "Unregistered %s from worksneeze" root))
+    root))
 
 (defun worksneeze--project-display-name (repo-root)
   "Return a short display name for REPO-ROOT."
@@ -487,6 +535,32 @@ info plists with :number, :title, :draft, :url.")
      ((string-match "github\\.com/\\([^/]+/[^/]+?\\)\\(?:\\.git\\)?$" url)
       (match-string 1 url)))))
 
+(defun worksneeze--pr-fetch-success (dashboard repo-root data
+                                               _headers _status _req)
+  "Record DATA for REPO-ROOT in DASHBOARD after a successful PR fetch."
+  (when (buffer-live-p dashboard)
+    (with-current-buffer dashboard
+      (setq worksneeze--pr-fetch-in-progress
+            (delete repo-root worksneeze--pr-fetch-in-progress))
+      (setf (alist-get repo-root worksneeze--pr-data nil nil #'equal)
+            (mapcar
+             (lambda (pr)
+               (cons (alist-get 'ref (alist-get 'head pr))
+                     (list :number (alist-get 'number pr)
+                           :title (alist-get 'title pr)
+                           :draft (eq (alist-get 'draft pr) t)
+                           :url (alist-get 'html_url pr))))
+             data))
+      (worksneeze--render))))
+
+(defun worksneeze--pr-fetch-error (dashboard repo-root
+                                             _err _headers _status _req)
+  "Clear fetch state for REPO-ROOT in DASHBOARD after a failed PR fetch."
+  (when (buffer-live-p dashboard)
+    (with-current-buffer dashboard
+      (setq worksneeze--pr-fetch-in-progress
+            (delete repo-root worksneeze--pr-fetch-in-progress)))))
+
 (defun worksneeze--fetch-pr-data-for (repo-root)
   "Asynchronously fetch open PR data for REPO-ROOT.
 Stores results in the REPO-ROOT entry of `worksneeze--pr-data'
@@ -494,35 +568,16 @@ and re-renders the dashboard when complete."
   (when (and (featurep 'ghub)
              (not (member repo-root worksneeze--pr-fetch-in-progress)))
     (let ((repo (worksneeze--github-repo repo-root))
-          (dashboard-buf (current-buffer)))
+          (dashboard (current-buffer)))
       (when repo
         (push repo-root worksneeze--pr-fetch-in-progress)
         (ghub-get (format "/repos/%s/pulls" repo)
                   `((state . "open") (per_page . 100))
                   :auth 'forge
-                  :callback
-                  (lambda (data _headers _status _req)
-                    (when (buffer-live-p dashboard-buf)
-                      (with-current-buffer dashboard-buf
-                        (setq worksneeze--pr-fetch-in-progress
-                              (delete repo-root worksneeze--pr-fetch-in-progress))
-                        (setf (alist-get repo-root worksneeze--pr-data
-                                         nil nil #'equal)
-                              (mapcar
-                               (lambda (pr)
-                                 (cons (alist-get 'ref (alist-get 'head pr))
-                                       (list :number (alist-get 'number pr)
-                                             :title (alist-get 'title pr)
-                                             :draft (eq (alist-get 'draft pr) t)
-                                             :url (alist-get 'html_url pr))))
-                               data))
-                        (worksneeze--render))))
-                  :errorback
-                  (lambda (_err _headers _status _req)
-                    (when (buffer-live-p dashboard-buf)
-                      (with-current-buffer dashboard-buf
-                        (setq worksneeze--pr-fetch-in-progress
-                              (delete repo-root worksneeze--pr-fetch-in-progress))))))))))
+                  :callback (apply-partially #'worksneeze--pr-fetch-success
+                                             dashboard repo-root)
+                  :errorback (apply-partially #'worksneeze--pr-fetch-error
+                                              dashboard repo-root))))))
 
 (defun worksneeze--pr-info-string (branch repo-root)
   "Return a propertized PR info string for BRANCH in REPO-ROOT, or nil."
@@ -548,33 +603,69 @@ and re-renders the dashboard when complete."
   "Return non-nil if WORKTREE is the main worktree (the repo root)."
   (string= (file-name-as-directory (alist-get :path worktree)) repo-root))
 
+(defun worksneeze--format-worktree-status (lines)
+  "Return a propertized status string for porcelain status LINES."
+  (if (null lines)
+      (propertize "clean" 'face 'worksneeze-clean)
+    (let ((staged 0) (modified 0) (untracked 0))
+      (dolist (line lines)
+        (when (>= (length line) 2)
+          (let ((x (aref line 0))
+                (y (aref line 1)))
+            (cond
+             ((= x ??) (cl-incf untracked))
+             ((memq x '(?M ?A ?D ?R ?C)) (cl-incf staged)))
+            (when (memq y '(?M ?D))
+              (cl-incf modified)))))
+      (let ((parts nil))
+        (when (> staged 0) (push (format "%d staged" staged) parts))
+        (when (> modified 0) (push (format "%d modified" modified) parts))
+        (when (> untracked 0) (push (format "%d untracked" untracked) parts))
+        (propertize (string-join (nreverse parts) ", ")
+                    'face 'worksneeze-dirty)))))
+
+(defun worksneeze--status-sentinel (process _event)
+  "Record the result when a worktree status PROCESS finishes."
+  (when (memq (process-status process) '(exit signal))
+    (let ((dashboard (process-get process 'worksneeze-dashboard))
+          (path (process-get process 'worksneeze-path)))
+      (when (buffer-live-p dashboard)
+        (with-current-buffer dashboard
+          (remhash path worksneeze--status-processes)
+          (puthash path
+                   (if (zerop (process-exit-status process))
+                       (with-current-buffer (process-buffer process)
+                         (split-string (buffer-string) "\n" t))
+                     :error)
+                   worksneeze--status-cache)
+          (worksneeze--render)))
+      (when (buffer-live-p (process-buffer process))
+        (kill-buffer (process-buffer process))))))
+
+(defun worksneeze--start-status-process (path)
+  "Start an asynchronous status query for PATH for the current dashboard."
+  (let* ((dashboard (current-buffer))
+         (output (generate-new-buffer " *worksneeze-status*"))
+         (process (make-process
+                   :name "worksneeze-status"
+                   :buffer output
+                   :command (list "git" "-C" path "status" "--porcelain")
+                   :noquery t
+                   :sentinel #'worksneeze--status-sentinel)))
+    (process-put process 'worksneeze-dashboard dashboard)
+    (process-put process 'worksneeze-path path)
+    (puthash path process worksneeze--status-processes)))
+
 (defun worksneeze--worktree-status-string (path)
-  "Return a propertized git status string for worktree at PATH."
-  (let ((default-directory (file-name-as-directory path)))
-    (condition-case nil
-        (let ((lines (worksneeze--run-git "status" "--porcelain")))
-          (if (null lines)
-              (propertize "clean" 'face 'worksneeze-clean)
-            (let ((staged 0) (modified 0) (untracked 0))
-              (dolist (line lines)
-                (when (>= (length line) 2)
-                  (let ((x (aref line 0))
-                        (y (aref line 1)))
-                    (cond
-                     ((= x ??) (cl-incf untracked))
-                     ((memq x '(?M ?A ?D ?R ?C)) (cl-incf staged)))
-                    (when (memq y '(?M ?D))
-                      (cl-incf modified)))))
-              (let ((parts nil))
-                (when (> staged 0)
-                  (push (format "%d staged" staged) parts))
-                (when (> modified 0)
-                  (push (format "%d modified" modified) parts))
-                (when (> untracked 0)
-                  (push (format "%d untracked" untracked) parts))
-                (propertize (string-join (nreverse parts) ", ")
-                            'face 'worksneeze-dirty)))))
-      (error (propertize "unknown" 'face 'worksneeze-head)))))
+  "Return cached status for PATH, starting an asynchronous query if needed."
+  (let ((cached (gethash path worksneeze--status-cache 'missing)))
+    (cond
+     ((eq cached :error) (propertize "unknown" 'face 'worksneeze-head))
+     ((not (eq cached 'missing)) (worksneeze--format-worktree-status cached))
+     (t
+      (unless (gethash path worksneeze--status-processes)
+        (worksneeze--start-status-process path))
+      (propertize "checking…" 'face 'worksneeze-head)))))
 
 (defun worksneeze--render-worktree-entry (wt repo-root &optional marker)
   "Render a worktree entry for WT in project REPO-ROOT as a multi-line block.
@@ -673,15 +764,9 @@ Falls back to the project header for ROOT, then to `point-min'."
     (erase-buffer)
     (insert (propertize "Worksneeze" 'face 'worksneeze-header) "\n\n")
     (if (null projects)
-        (insert (propertize "No projects with managed worktrees found.\n\n"
+        (insert (propertize "No projects are registered with worksneeze.\n\n"
                             'face 'worksneeze-empty)
-                "Press `c' to create a worktree in a project,\n"
-                "or ensure your projects are registered with "
-                (pcase worksneeze-project-backend
-                  ('projectile "projectile")
-                  ('project "project.el")
-                  (_ "your project backend"))
-                ".\n")
+                "Run `worksneeze-register-project' to add one.\n")
       (dolist (repo-root projects)
         (worksneeze--render-project-section repo-root)))
     (worksneeze--restore-point saved-path saved-root)
@@ -792,6 +877,8 @@ Does not include n/p, which are only bound for non-evil users.")
   :group 'worksneeze
   (setq truncate-lines t)
   (buffer-disable-undo)
+  (setq-local worksneeze--status-cache (make-hash-table :test #'equal))
+  (setq-local worksneeze--status-processes (make-hash-table :test #'equal))
   ;; When evil-mode is active, Doom's special-mode integration remaps evil
   ;; commands like evil-delete-line to `ignore'.  Since D/x/u etc. resolve
   ;; through evil commands before reaching our mode-map bindings, we must
@@ -805,16 +892,8 @@ Does not include n/p, which are only bound for non-evil users.")
 ;;; Entry Points
 
 (defun worksneeze--collect-roots ()
-  "Return deduplicated list of project roots to show in the dashboard.
-Merges all projects that have a managed worktree directory with the
-repo root of `default-directory' (if it also has one)."
-  (let* ((discovered (worksneeze--projects-with-worksneeze))
-         (current-root (worksneeze--repo-root-for default-directory)))
-    (delete-dups
-     (append discovered
-             (when (and current-root
-                        (worksneeze--has-managed-dir-p current-root))
-               (list current-root))))))
+  "Return registered project roots to show in the dashboard."
+  (worksneeze--registered-projects))
 
 ;;;###autoload
 (defun worksneeze ()
@@ -823,17 +902,33 @@ repo root of `default-directory' (if it also has one)."
   (let ((buf (get-buffer-create worksneeze-buffer-name)))
     (with-current-buffer buf
       (worksneeze-mode)
-      (setq-local worksneeze--project-roots (worksneeze--collect-roots))
-      (worksneeze--render))
-    (pop-to-buffer buf)))
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (propertize "Worksneeze" 'face 'worksneeze-header)
+                "\n\nDiscovering worktrees…\n")))
+    (pop-to-buffer buf)
+    ;; Let Emacs display the dashboard before project and worktree discovery.
+    (with-current-buffer buf
+      (setq-local
+       worksneeze--load-timer
+       (run-at-time
+        0 nil
+        (lambda (dashboard)
+          (when (buffer-live-p dashboard)
+            (with-current-buffer dashboard
+              (setq worksneeze--load-timer nil)
+              (setq worksneeze--project-roots (worksneeze--collect-roots))
+              (worksneeze--render))))
+        buf)))))
 
 (defun worksneeze-refresh ()
-  "Refresh the worksneeze dashboard, re-discovering projects."
+  "Refresh the worksneeze dashboard and its registered projects."
   (interactive)
   (unless (derived-mode-p 'worksneeze-mode)
     (user-error "Not in a worksneeze buffer"))
   (let ((all-roots (worksneeze--collect-roots)))
     (setq-local worksneeze--project-roots all-roots)
+    (clrhash worksneeze--status-cache)
     (setq worksneeze--pr-data nil)
     (setq worksneeze--pr-fetch-in-progress nil)
     (worksneeze--render)
@@ -1043,24 +1138,31 @@ The mark column is at column 1 on the header line of the entry."
               (message "Removed worktree: %s" path)))))
       (worksneeze-refresh))))
 
-;;; Projectile Integration
+;;; Repository-local excludes
 
-(defun worksneeze--ensure-worktrees-ignored (root)
-  "Ensure the worktree directory is in ROOT's .gitignore."
-  (let ((gitignore (expand-file-name ".gitignore" root))
-        (entry (concat worksneeze-worktree-directory "/")))
-    (unless (and (file-exists-p gitignore)
+(defun worksneeze--ensure-worktrees-excluded (root)
+  "Exclude the worktree directory locally without changing tracked files.
+The entry is written to the repository's common Git info/exclude file, so it
+applies to the main checkout and all linked worktrees without touching any
+branch's .gitignore."
+  (let* ((default-directory root)
+         (common-dir (car (worksneeze--run-git "rev-parse" "--git-common-dir")))
+         (exclude-file (expand-file-name "info/exclude"
+                                         (expand-file-name common-dir root)))
+         (entry (concat "/" worksneeze-worktree-directory "/")))
+    (unless (and (file-exists-p exclude-file)
                  (with-temp-buffer
-                   (insert-file-contents gitignore)
+                   (insert-file-contents exclude-file)
                    (goto-char (point-min))
                    (re-search-forward (concat "^" (regexp-quote entry) "$") nil t)))
+      (make-directory (file-name-directory exclude-file) t)
       (with-temp-buffer
-        (when (file-exists-p gitignore)
-          (insert-file-contents gitignore)
+        (when (file-exists-p exclude-file)
+          (insert-file-contents exclude-file)
           (goto-char (point-max))
           (unless (bolp) (insert "\n")))
         (insert entry "\n")
-        (write-region (point-min) (point-max) gitignore)))))
+        (write-region (point-min) (point-max) exclude-file nil 'silent)))))
 
 ;;; Branch Helpers
 
@@ -1144,7 +1246,8 @@ REPO-ROOT specifies which project to create the worktree in."
         (user-error "Path already exists: %s" wt-path))
       (unless (file-directory-p wt-parent)
         (make-directory wt-parent t))
-      (worksneeze--ensure-worktrees-ignored root)
+      (when worksneeze-exclude-worktree-directory
+        (worksneeze--ensure-worktrees-excluded root))
       (let ((default-directory root))
         (cond
          ;; Remote branch selected — track it

@@ -9,13 +9,13 @@ An Emacs package for managing git worktrees across all your projects.
 
 * Overview
 
-worksneeze provides a cross-project dashboard for viewing and managing git worktrees. It discovers all known projects (via projectile or project.el), finds the ones that have worksneeze-managed worktrees, and shows them grouped by project in a single buffer.
+worksneeze provides a cross-project dashboard for viewing and managing git worktrees. Projects explicitly opt in to the dashboard and are shown together in a single buffer.
 
 Worktrees are stored in a =.worksneeze/= subdirectory under each project's repo root.
 
 * Features
 
-- *Dashboard* (~M-x worksneeze~): Lists managed worktrees across all known projects, grouped by repo. Shows branch, HEAD SHA, git status, and optionally PR info, agent status, and compilation status.
+- *Dashboard* (~M-x worksneeze~): Lists worktrees across registered projects, grouped by repo. Shows branch, HEAD SHA, git status, and optionally PR info, agent status, and compilation status.
 - *Create* (~c~ in dashboard, or ~M-x worksneeze-create~): Creates a new worktree under =.worksneeze/=. Offers completion from remote branches; free-form input creates a new branch. ~C-u~ prefix prompts for a base branch/commit.
 - *Create from PR* (~P~ in dashboard, or ~M-x worksneeze-create-from-pr~): Resolves a GitHub PR URL via the =gh= CLI and creates a tracking worktree for it.
 - *Delete* (dired-style): Mark worktrees with ~D~, unmark with ~u~, execute with ~x~.
@@ -72,7 +72,9 @@ Or clone the repo and add it to your load path manually:
 
 * Customization
 
+- ~worksneeze-registered-project-roots~: Projects included in the dashboard. Projects can also be added with ~M-x worksneeze-register-project~ and removed with ~M-x worksneeze-unregister-project~.
 - ~worksneeze-worktree-directory~ (default =".worksneeze"=): Subdirectory under the repo root where new worktrees are placed.
+- ~worksneeze-exclude-worktree-directory~ (default =t=): Add the worktree directory to the repository-local Git exclude file when creating a worktree. Set to =nil= to leave ignore configuration untouched.
 - ~worksneeze-buffer-name~ (default ="*worksneeze*"=): Dashboard buffer name.
 - ~worksneeze-use-magit~ (default ='auto=): Controls whether ~RET~ opens magit or dired. Options: =auto=, =t=, =nil=.
 - ~worksneeze-project-backend~ (default ='auto=): How to discover known projects. Options: =auto= (tries projectile, then project.el), =projectile=, =project=, =custom=.
@@ -111,6 +113,6 @@ The dashboard will then show compile status (running/done) for that worktree, an
 - [[https://github.com/magit/transient][transient]] (required)
 - magit (optional)
 - ghub (optional, for PR display)
-- projectile or project.el (optional, for project discovery)
+- projectile or project.el (optional, for selecting a project when creating a worktree)
 - =gh= CLI (optional, for ~worksneeze-create-from-pr~)
 - agent-shell (optional)
